@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_offset TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sync_lock (
+    id INTEGER PRIMARY KEY,
+    locked_at TIMESTAMP NOT NULL,
+    locked_by TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_app_versions_id ON app_versions(id);
 CREATE INDEX IF NOT EXISTS idx_app_versions_name ON app_versions(name);

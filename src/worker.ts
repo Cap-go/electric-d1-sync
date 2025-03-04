@@ -212,6 +212,45 @@ async function syncDatabase(db: D1Database, region: string, env: Env) {
   console.log(`[${region}] Database sync completed in ${Date.now() - start}ms`);
 }
 
+async function acquireLock(db: D1Database): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    // Try to insert a lock record
+    await db.prepare(`
+      INSERT INTO sync_lock (id, locked_at, locked_by)
+      VALUES (1, ?, ?)
+    `).bind(now, 'worker').run();
+    return true;
+  } catch (error) {
+    // If insert fails, check if lock is stale (older than 5 minutes)
+    const lock = await db.prepare(`
+      SELECT locked_at FROM sync_lock WHERE id = 1
+    `).first() as { locked_at: string } | undefined;
+    
+    if (lock) {
+      const lockTime = new Date(lock.locked_at);
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+      
+      if (lockTime < fiveMinutesAgo) {
+        // Lock is stale, try to update it
+        await db.prepare(`
+          UPDATE sync_lock 
+          SET locked_at = ?, locked_by = ?
+          WHERE id = 1
+        `).bind(now, 'worker').run();
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+async function releaseLock(db: D1Database): Promise<void> {
+  await db.prepare(`
+    DELETE FROM sync_lock WHERE id = 1
+  `).run();
+}
+
 async function handleSync(env: Env) {
   const start = Date.now();
   console.log('Starting global sync');
@@ -225,13 +264,25 @@ async function handleSync(env: Env) {
     { db: env.DB_AF, region: "AF" }
   ];
 
-  // Initialize all databases
-  await Promise.all(dbs.map(({ db, region }) => checkAndCreateTables(db, region)));
-  
-  // Sync all databases in parallel
-  await Promise.all(dbs.map(({ db, region }) => syncDatabase(db, region, env)));
-  
-  console.log(`Global sync completed in ${Date.now() - start}ms`);
+  // Try to acquire lock on first database
+  const hasLock = await acquireLock(dbs[0].db);
+  if (!hasLock) {
+    console.log('Another sync is already running, skipping this one');
+    return;
+  }
+
+  try {
+    // Initialize all databases
+    await Promise.all(dbs.map(({ db, region }) => checkAndCreateTables(db, region)));
+    
+    // Sync all databases in parallel
+    await Promise.all(dbs.map(({ db, region }) => syncDatabase(db, region, env)));
+    
+    console.log(`Global sync completed in ${Date.now() - start}ms`);
+  } finally {
+    // Always release the lock
+    await releaseLock(dbs[0].db);
+  }
 }
 
 async function getLastOffset(db: D1Database, tableName: string): Promise<Offset | undefined> {
