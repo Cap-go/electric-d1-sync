@@ -3,8 +3,9 @@
   "module": "src/worker.ts",
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy && wrangler secret bulk --env-from=.env",
-    "deploy:dev": "wrangler deploy --env=development && wrangler secret bulk --env-from=.env.development --env=development"
+    "deploy:secrets": "wrangler secret bulk .env",
+    "deploy": "wrangler deploy && wrangler secret bulk .env",
+    "deploy:dev": "wrangler deploy --env=development && wrangler secret bulk .env.development --env=development"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",
