@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { ShapeStream, isChangeMessage, isControlMessage, type Offset } from "@electric-sql/client";
-import schemaSql from "./schema.sql";
+import { schema } from "./schema";
 
 interface Env {
   DB_NA: D1Database;  // North America
@@ -91,7 +91,7 @@ async function checkAndCreateTables(db: D1Database, region: string) {
     const missingTables = TABLES.filter(t => !existingTables.has(t.name));
     if (missingTables.length > 0) {
       console.log(`[${region}] Creating ${missingTables.length} missing tables: ${missingTables.map(t => t.name).join(', ')}`);
-      await db.exec(schemaSql);
+      await db.exec(schema);
       console.log(`[${region}] Tables created in ${Date.now() - start}ms`);
     } else {
       console.log(`[${region}] All tables exist, no changes needed`);
