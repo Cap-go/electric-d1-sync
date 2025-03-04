@@ -1,15 +1,15 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { ShapeStream, isChangeMessage, isControlMessage, type Offset } from "@electric-sql/client";
-import schemaSql from "./schema.sql";
+import { schema } from "./schema.ts";
 
 interface Env {
-  DB_NA: D1Database;  // North America
-  DB_EU: D1Database;  // Europe
-  DB_ASIA: D1Database;  // Asia
-  DB_SA: D1Database;  // South America
-  DB_OC: D1Database;  // Oceania
-  DB_AF: D1Database;  // Africa
+  DB_ENA: D1Database;  // East North America
+  DB_WNA: D1Database;  // West North America
+  DB_WEU: D1Database;  // West Europe
+  DB_EEU: D1Database;  // East Europe
+  DB_ASIA: D1Database; // Asia
+  DB_OC: D1Database;   // Oceania
   ELECTRIC_URL: string;
   WEBHOOK_SECRET: string;
   ELECTRIC_SOURCE_ID: string;
@@ -91,7 +91,7 @@ async function checkAndCreateTables(db: D1Database, region: string) {
     const missingTables = TABLES.filter(t => !existingTables.has(t.name));
     if (missingTables.length > 0) {
       console.log(`[${region}] Creating ${missingTables.length} missing tables: ${missingTables.map(t => t.name).join(', ')}`);
-      await db.exec(schemaSql);
+      await db.exec(schema);
       console.log(`[${region}] Tables created in ${Date.now() - start}ms`);
     } else {
       console.log(`[${region}] All tables exist, no changes needed`);
@@ -256,12 +256,12 @@ async function handleSync(env: Env) {
   console.log('Starting global sync');
   
   const dbs: DBSync[] = [
-    { db: env.DB_NA, region: "NA" },
-    { db: env.DB_EU, region: "EU" },
+    { db: env.DB_ENA, region: "ENA" },
+    { db: env.DB_WNA, region: "WNA" },
+    { db: env.DB_WEU, region: "WEU" },
+    { db: env.DB_EEU, region: "EEU" },
     { db: env.DB_ASIA, region: "ASIA" },
-    { db: env.DB_SA, region: "SA" },
     { db: env.DB_OC, region: "OC" },
-    { db: env.DB_AF, region: "AF" }
   ];
 
   // Try to acquire lock on first database

@@ -2,9 +2,15 @@
   "name": "electric-d1-sync",
   "module": "src/worker.ts",
   "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy && wrangler secret bulk --env-from=.env",
+    "deploy:dev": "wrangler deploy --env=development && wrangler secret bulk --env-from=.env.development --env=development"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "wrangler": "^3.112.0",
+    "sql-template-tag": "^3.0.0"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"

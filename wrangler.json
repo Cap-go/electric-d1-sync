@@ -2,44 +2,39 @@
   "name": "electric-d1-sync",
   "main": "src/worker.ts",
   "compatibility_date": "2024-11-11",
+  "compatibility_flags": ["nodejs_compat_v2"],
   "d1_databases": [
     {
-      "binding": "DB_NA",
-      "database_name": "electric-sync-na",
-      "database_id": "YOUR_NA_DATABASE_ID"
+      "binding": "DB_ENA",
+      "database_name": "electric-sync-ena",
+      "database_id": "ace4d744-28e6-4a7f-825f-61366db888f3"
     },
     {
-      "binding": "DB_EU",
-      "database_name": "electric-sync-eu",
-      "database_id": "YOUR_EU_DATABASE_ID"
+      "binding": "DB_WNA",
+      "database_name": "electric-sync-wna",
+      "database_id": "877d5831-1606-49ce-8fe5-334f49cd6260"
+    },
+    {
+      "binding": "DB_WEU",
+      "database_name": "electric-sync-weu",
+      "database_id": "d1f10b2f-7b46-4398-8e45-922184506db0"
+    },
+    {
+      "binding": "DB_EEU",
+      "database_name": "electric-sync-eeu",
+      "database_id": "295a8850-a0c1-4742-bee1-1dd4f99a5f96"
     },
     {
       "binding": "DB_ASIA",
       "database_name": "electric-sync-asia",
-      "database_id": "YOUR_ASIA_DATABASE_ID"
-    },
-    {
-      "binding": "DB_SA",
-      "database_name": "electric-sync-sa",
-      "database_id": "YOUR_SA_DATABASE_ID"
+      "database_id": "69ad6959-0171-4838-9b7c-35867d5aab9a"
     },
     {
       "binding": "DB_OC",
       "database_name": "electric-sync-oc",
-      "database_id": "YOUR_OC_DATABASE_ID"
-    },
-    {
-      "binding": "DB_AF",
-      "database_name": "electric-sync-af",
-      "database_id": "YOUR_AF_DATABASE_ID"
+      "database_id": "9936bf39-5c8a-48b6-990b-5e6e3658034a"
     }
   ],
-  "vars": {
-    "ELECTRIC_URL": "http://localhost:3333/v1/shape",
-    "WEBHOOK_SECRET": "your-secret-here",
-    "ELECTRIC_SOURCE_ID": "",
-    "ELECTRIC_SOURCE_SECRET": ""
-  },
   "triggers": {
     "crons": ["* * * * *"]
   }
