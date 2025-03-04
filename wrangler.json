@@ -34,12 +34,6 @@
       "database_id": "YOUR_AF_DATABASE_ID"
     }
   ],
-  "vars": {
-    "ELECTRIC_URL": "http://localhost:3333/v1/shape",
-    "WEBHOOK_SECRET": "your-secret-here",
-    "ELECTRIC_SOURCE_ID": "",
-    "ELECTRIC_SOURCE_SECRET": ""
-  },
   "triggers": {
     "crons": ["* * * * *"]
   }
