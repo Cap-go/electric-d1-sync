@@ -9,6 +9,7 @@
         "better-sqlite3": "^11.8.1",
       },
       "devDependencies": {
+        "@cloudflare/workers-types": "^4.20240208.0",
         "@types/bun": "latest",
       },
       "peerDependencies": {
@@ -17,6 +18,8 @@
     },
   },
   "packages": {
+    "@cloudflare/workers-types": ["@cloudflare/workers-types@4.20250303.0", "", {}, "sha512-O7F7nRT4bbmwHf3gkRBLfJ7R6vHIJ/oZzWdby6obOiw2yavUfp/AIwS7aO2POu5Cv8+h3TXS3oHs3kKCZLraUA=="],
+
     "@electric-sql/client": ["@electric-sql/client@1.0.0-beta.4", "", { "optionalDependencies": { "@rollup/rollup-darwin-arm64": "^4.18.1" } }, "sha512-UKiS0WJHVL91mvcZPPXuUGE9vSFB8zjNuYESUUNKqO+jhaebxwI6e8SHx4nHH1P4RD5hotGGvQNErz8ViB9b7Q=="],
 
     "@rollup/rollup-darwin-arm64": ["@rollup/rollup-darwin-arm64@4.34.9", "", { "os": "darwin", "cpu": "arm64" }, "sha512-0CY3/K54slrzLDjOA7TOjN1NuLKERBgk9nY5V34mhmuu673YNb+7ghaDUs6N0ujXR7fz5XaS5Aa6d2TNxZd0OQ=="],

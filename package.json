@@ -1,8 +1,9 @@
 {
   "name": "electric-d1-sync",
-  "module": "index.ts",
+  "module": "src/worker.ts",
   "type": "module",
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240208.0",
     "@types/bun": "latest"
   },
   "peerDependencies": {
