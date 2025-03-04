@@ -11,7 +11,7 @@ This is a basic example of how to sync data from Postgres to Cloudflare D1 read 
 
 1. Clone the repository
 2. Run `npm install` to install the dependencies
-3. Run `docker compose up` to start the Postgres and ElectricSQL servers
+3. Copy `.env.example` to `.env` and fill in your environment variables
 4. Create D1 databases for each region:
    ```bash
    wrangler d1 create electric-sync-na  # North America
@@ -26,102 +26,6 @@ This is a basic example of how to sync data from Postgres to Cloudflare D1 read 
    ```bash
    wrangler deploy
    ```
-
-## Database Schema
-
-The worker expects the following schema in each D1 database:
-
-```sql
--- App Versions
-CREATE TABLE IF NOT EXISTS app_versions (
-    id INTEGER PRIMARY KEY,
-    owner_org TEXT,
-    app_id TEXT,
-    name TEXT,
-    r2_path TEXT,
-    user_id TEXT,
-    deleted BOOLEAN,
-    external_url TEXT,
-    checksum TEXT,
-    session_key TEXT,
-    storage_provider TEXT,
-    min_update_version TEXT,
-    manifest JSON
-);
-
--- Channels
-CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    app_id TEXT,
-    version INTEGER,
-    created_by TEXT,
-    owner_org TEXT,
-    public BOOLEAN,
-    disable_auto_update_under_native BOOLEAN,
-    disable_auto_update TEXT,
-    ios BOOLEAN,
-    android BOOLEAN,
-    allow_device_self_set BOOLEAN,
-    allow_emulator BOOLEAN,
-    allow_dev BOOLEAN
-);
-
--- Channel Devices
-CREATE TABLE IF NOT EXISTS channel_devices (
-    id INTEGER PRIMARY KEY,
-    channel_id INTEGER,
-    app_id TEXT,
-    device_id TEXT,
-    owner_org TEXT
-);
-
--- Apps
-CREATE TABLE IF NOT EXISTS apps (
-    id TEXT PRIMARY KEY,
-    app_id TEXT,
-    icon_url TEXT,
-    user_id TEXT,
-    name TEXT,
-    last_version TEXT,
-    retention INTEGER,
-    owner_org TEXT,
-    default_upload_channel TEXT,
-    transfer_history TEXT
-);
-
--- Organizations
-CREATE TABLE IF NOT EXISTS orgs (
-    id TEXT PRIMARY KEY,
-    created_by TEXT,
-    logo TEXT,
-    name TEXT,
-    management_email TEXT,
-    customer_id TEXT
-);
-
--- Stripe Info
-CREATE TABLE IF NOT EXISTS stripe_info (
-    id TEXT PRIMARY KEY,
-    customer_id TEXT,
-    status TEXT,
-    trial_at TEXT,
-    is_good_plan BOOLEAN,
-    mau_exceeded BOOLEAN,
-    storage_exceeded BOOLEAN,
-    bandwidth_exceeded BOOLEAN
-);
-
--- Sync State
-CREATE TABLE IF NOT EXISTS sync_state (
-    table_name TEXT PRIMARY KEY,
-    last_offset TEXT NOT NULL
-);
-```
-
-## Adding data to Postgres
-
-Run `docker compose exec postgres psql -U postgres -d electric` to start a `psql` terminal to the Postgres server. You can use this to add data to the Postgres tables.
 
 ## How it Works
 
@@ -149,13 +53,40 @@ curl -X POST https://your-worker.workers.dev/webhook \
 
 You can set up database triggers or application hooks to call this endpoint whenever relevant tables change.
 
+## Nuke Webhook
+
+To clear data from replicas, use the `/nuke` endpoint with different options:
+
+### Nuke All Databases
+```bash
+curl -X POST https://your-worker.workers.dev/nuke \
+  -H "x-webhook-signature: your-secret-here" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "all"}'
+```
+
+### Nuke Specific Database
+```bash
+curl -X POST https://your-worker.workers.dev/nuke \
+  -H "x-webhook-signature: your-secret-here" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "db", "db": "electric-sync-eu"}'
+```
+
+### Nuke Specific Table
+```bash
+curl -X POST https://your-worker.workers.dev/nuke \
+  -H "x-webhook-signature: your-secret-here" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "table", "db": "electric-sync-eu", "table": "apps"}'
+```
+
 ## Stopping the Sync
 
 To stop the sync:
 
 1. Remove the cron trigger from `wrangler.toml`
 2. Redeploy the worker
-3. Stop the Postgres and ElectricSQL servers with `docker compose down`
 
 ## Resetting the Sync
 
@@ -163,5 +94,3 @@ To reset the sync:
 
 1. Delete the data from all D1 databases
 2. Restart the sync process
-
-To clear the Postgres data, you can run `docker compose down -v` to stop the Postgres and ElectricSQL servers and remove the volumes.
