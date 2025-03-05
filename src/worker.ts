@@ -31,6 +31,11 @@ interface NukeRequest {
   table?: string;
 }
 
+interface SyncRequest {
+  region: string;
+  table: string;
+}
+
 interface TableSchema {
   name: string;
   columns: string[];
@@ -90,19 +95,71 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
     
-    if (url.pathname === "/webhook") {
-      return handleWebhook(request, env);
-    }
-
     if (url.pathname === "/nuke") {
       return handleNuke(request, env);
+    }
+    
+    if (url.pathname === "/sync") {
+      return handleSyncRequest(request, env);
     }
     
     return new Response("Not found", { status: 404 });
   },
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(handleSync(env));
+    try {
+      // Initialize all databases first
+      const dbs: DBSync[] = [
+        { db: env.DB_ENA, region: "ENA" },
+        { db: env.DB_WNA, region: "WNA" },
+        { db: env.DB_WEU, region: "WEU" },
+        { db: env.DB_EEU, region: "EEU" },
+        { db: env.DB_ASIA, region: "ASIA" },
+        { db: env.DB_OC, region: "OC" },
+      ];
+      
+      await Promise.all(dbs.map(({ db, region }) => checkAndCreateTables(db, region)));
+      
+      // Trigger individual sync requests for each table and database
+      const promises = [];
+      
+      // Get the worker URL from the cron event
+      const workerUrl = new URL("https://electric-d1-sync.workers.dev");
+      
+      for (const { region } of dbs) {
+        for (const table of TABLES) {
+          // Use fetch to call our own /sync endpoint
+          const syncUrl = new URL(workerUrl);
+          syncUrl.pathname = "/sync";
+          
+          const req = new Request(syncUrl.toString(), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-webhook-signature": env.WEBHOOK_SECRET,
+            },
+            body: JSON.stringify({ region, table: table.name }),
+          });
+          
+          // Execute the fetch but don't wait for it (fire and forget)
+          const promise = fetch(req).then(resp => {
+            if (!resp.ok) {
+              console.error(`Error syncing ${table.name} in ${region}: ${resp.status} ${resp.statusText}`);
+            }
+          }).catch(err => {
+            console.error(`Error triggering sync for ${table.name} in ${region}:`, err);
+          });
+          
+          promises.push(promise);
+        }
+      }
+      
+      // Wait for all triggers to be sent (not for them to complete)
+      await Promise.all(promises);
+      console.log(`Triggered sync for all tables and databases`);
+    } catch (error) {
+      console.error("Error during scheduled sync:", error);
+    }
   }
 };
 
@@ -133,25 +190,11 @@ async function checkAndCreateTables(db: D1Database, region: string) {
   }
 }
 
-async function handleWebhook(request: Request, env: Env) {
-  if (request.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
-  }
-
-  const signature = request.headers.get("x-webhook-signature");
-  if (!signature || signature !== env.WEBHOOK_SECRET) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-
-  // Start sync in background
-  const syncPromise = handleSync(env);
-  return new Response("Sync started", { status: 200 });
-}
-
 function handleMessage(msg: any, table: TableSchema) {
   const { headers, value } = msg;
   const columns = table.columns.filter(col => col !== table.primaryKey);
-  const values = columns.map(col => value[col]);
+  // fix bigint issue with D1
+  const values = columns.map(col => typeof value[col] === 'bigint' ? Number(value[col]) : value[col]);
 
   switch (headers.operation) {
     case "insert":
@@ -426,4 +469,62 @@ async function nukeTable(db: D1Database, tableName: string, region: string) {
   await db.exec(TABLE_SCHEMAS[tableName as keyof typeof TABLE_SCHEMAS]);
   await db.prepare("DELETE FROM sync_state WHERE table_name = ?").bind(tableName).run();
   console.log(`[${region}] Table ${tableName} nuked`);
+}
+
+async function handleSyncRequest(request: Request, env: Env) {
+  // Validate request method
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+  
+  // Validate signature
+  const signature = request.headers.get("x-webhook-signature");
+  if (!signature || signature !== env.WEBHOOK_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+  
+  try {
+    // Parse request body
+    const body = await request.json() as SyncRequest;
+    const { region, table: tableName } = body;
+    
+    // Validate region
+    const dbMap: Record<string, D1Database> = {
+      "ENA": env.DB_ENA,
+      "WNA": env.DB_WNA,
+      "WEU": env.DB_WEU,
+      "EEU": env.DB_EEU,
+      "ASIA": env.DB_ASIA,
+      "OC": env.DB_OC,
+    };
+    
+    const db = dbMap[region];
+    if (!db) {
+      return new Response(`Invalid region: ${region}`, { status: 400 });
+    }
+    
+    // Validate table
+    const table = TABLES.find(t => t.name === tableName);
+    if (!table) {
+      return new Response(`Invalid table: ${tableName}`, { status: 400 });
+    }
+    
+    // Acquire lock for this table
+    const hasLock = await acquireLock(db, tableName);
+    if (!hasLock) {
+      return new Response(`Another sync is already running for table ${tableName} in ${region}`, { status: 409 });
+    }
+    
+    try {
+      // Perform the sync
+      await syncTable(db, table, region, env);
+      return new Response(`Successfully synced ${tableName} in ${region}`, { status: 200 });
+    } finally {
+      // Always release the lock
+      await releaseLock(db, tableName);
+    }
+  } catch (error) {
+    console.error("Error handling sync request:", error);
+    return new Response(error instanceof Error ? error.message : "Internal server error", { status: 500 });
+  }
 }

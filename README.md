@@ -5,7 +5,7 @@ Sync postgres table to d1 db multiple region
 
 ## Overview
 
-This is a basic example of how to sync data from Postgres to Cloudflare D1 read replicas across multiple regions using ElectricSQL. The sync worker runs every minute as a scheduled task and can also be triggered via webhook when changes occur in the database.
+This is a basic example of how to sync data from Postgres to Cloudflare D1 read replicas across multiple regions using ElectricSQL. The sync worker runs every minute as a scheduled task and each table/database combination is synced independently for better parallelization.
 
 ## Setup
 
@@ -29,29 +29,16 @@ This is a basic example of how to sync data from Postgres to Cloudflare D1 read 
 
 ## How it Works
 
-The sync process runs in two ways:
+The sync process runs as a scheduled task every minute. For each table in each database:
 
-1. **Scheduled Sync**: Every minute, the worker automatically checks for changes
-2. **Webhook Sync**: When changes occur in the database, it can trigger an immediate sync
-
-Each sync:
-1. Retrieves the last known offset from the `sync_state` table
-2. Connects to ElectricSQL and streams changes since the last offset
-3. Batches the changes and applies them to all D1 databases in parallel
-4. Saves the new offset for the next sync
+1. A separate sync request is made to the `/sync` endpoint
+2. The worker handles each request independently, spreading the load
+3. Each sync retrieves the last known offset from the `sync_state` table
+4. Connects to ElectricSQL and streams changes since the last offset
+5. Applies the changes to the D1 database
+6. Saves the new offset for the next sync
 
 The sync will automatically stop after 25 seconds (before the worker timeout) or when it receives an "up-to-date" message from ElectricSQL.
-
-## Webhook Integration
-
-To trigger an immediate sync when changes occur, send a POST request to the `/webhook` endpoint with the webhook secret in the header:
-
-```bash
-curl -X POST https://your-worker.workers.dev/webhook \
-  -H "x-webhook-signature: your-secret-here"
-```
-
-You can set up database triggers or application hooks to call this endpoint whenever relevant tables change.
 
 ## Nuke Webhook
 
