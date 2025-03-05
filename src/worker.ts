@@ -100,7 +100,7 @@ export default {
     }
     
     if (url.pathname === "/sync") {
-      return handleSyncRequest(request, env);
+      return handleSyncRequest(request, env, ctx);
     }
     
     return new Response("Not found", { status: 404 });
@@ -217,26 +217,35 @@ function handleMessage(msg: any, table: TableSchema) {
 
 async function syncTable(db: D1Database, table: TableSchema, region: string, env: Env) {
   const start = Date.now();
-  const lastKnownOffset = await getLastOffset(db, table.name);
+  const tableName = table.name;
   
-  console.log(`[${region}] Starting sync for table ${table.name} from offset ${lastKnownOffset || 'beginning'}`);
+  // Try to acquire lock for this table
+  const hasLock = await acquireLock(db, tableName);
+  if (!hasLock) {
+    console.log(`[${region}] Another sync is already running for table ${tableName}, skipping`);
+    return;
+  }
   
-  const stream = new ShapeStream({
-    url: env.ELECTRIC_URL,
-    params: {
-      table: table.name,
-      replica: "full",
-      source_id: env.ELECTRIC_SOURCE_ID,
-      source_secret: env.ELECTRIC_SOURCE_SECRET,
-    },
-    subscribe: false,
-    offset: lastKnownOffset,
-  });
-
-  let currentBatch: any[] = [];
-  let finalOffset: Offset | undefined;
-
   try {
+    const lastKnownOffset = await getLastOffset(db, tableName);
+    
+    console.log(`[${region}] Starting sync for table ${tableName} from offset ${lastKnownOffset || 'beginning'}`);
+    
+    const stream = new ShapeStream({
+      url: env.ELECTRIC_URL,
+      params: {
+        table: tableName,
+        replica: "full",
+        source_id: env.ELECTRIC_SOURCE_ID,
+        source_secret: env.ELECTRIC_SOURCE_SECRET,
+      },
+      subscribe: false,
+      offset: lastKnownOffset,
+    });
+
+    let currentBatch: any[] = [];
+    let finalOffset: Offset | undefined;
+
     await new Promise<void>((resolve, reject) => {
       stream.subscribe(
         async (messages) => {
@@ -255,23 +264,31 @@ async function syncTable(db: D1Database, table: TableSchema, region: string, env
         }
       );
     });
-
+      
     // Apply changes and save offset only if we have changes
     if (currentBatch.length > 0) {
-      console.log(`[${region}] Applying ${currentBatch.length} changes to table ${table.name}`);
+      console.log(`[${region}] Applying ${currentBatch.length} changes to table ${tableName}`);
       await db.batch(currentBatch);
       if (finalOffset) {
         await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset) VALUES (?, ?)")
-          .bind(table.name, finalOffset)
+          .bind(tableName, finalOffset)
           .run();
       }
-      console.log(`[${region}] Table ${table.name} synced in ${Date.now() - start}ms`);
+      console.log(`[${region}] Table ${tableName} synced in ${Date.now() - start}ms`);
     } else {
-      console.log(`[${region}] No changes for table ${table.name}`);
+      console.log(`[${region}] No changes for table ${tableName}`);
     }
   } catch (error) {
-    console.error(`[${region}] Error syncing table ${table.name}:`, error);
+    console.error(`[${region}] Error syncing table ${tableName}:`, error);
     throw error;
+  } finally {
+    // Always release the lock
+    try {
+      await releaseLock(db, tableName);
+      console.log(`[${region}] Released lock for ${tableName}`);
+    } catch (error) {
+      console.error(`[${region}] Error releasing lock for ${tableName}:`, error);
+    }
   }
 }
 
@@ -471,7 +488,7 @@ async function nukeTable(db: D1Database, tableName: string, region: string) {
   console.log(`[${region}] Table ${tableName} nuked`);
 }
 
-async function handleSyncRequest(request: Request, env: Env) {
+async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionContext) {
   // Validate request method
   if (request.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
@@ -509,20 +526,16 @@ async function handleSyncRequest(request: Request, env: Env) {
       return new Response(`Invalid table: ${tableName}`, { status: 400 });
     }
     
-    // Acquire lock for this table
-    const hasLock = await acquireLock(db, tableName);
-    if (!hasLock) {
-      return new Response(`Another sync is already running for table ${tableName} in ${region}`, { status: 409 });
-    }
+    // Run the sync in the background
+    ctx.waitUntil(
+      syncTable(db, table, region, env)
+        .catch(error => {
+          console.error(`Error syncing ${tableName} in ${region}:`, error);
+        })
+    );
     
-    try {
-      // Perform the sync
-      await syncTable(db, table, region, env);
-      return new Response(`Successfully synced ${tableName} in ${region}`, { status: 200 });
-    } finally {
-      // Always release the lock
-      await releaseLock(db, tableName);
-    }
+    // Return success immediately while the sync continues in the background
+    return new Response(`Sync started for ${tableName} in ${region}`, { status: 202 });
   } catch (error) {
     console.error("Error handling sync request:", error);
     return new Response(error instanceof Error ? error.message : "Internal server error", { status: 500 });
