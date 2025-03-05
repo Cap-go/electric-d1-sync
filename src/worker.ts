@@ -246,6 +246,8 @@ async function syncDatabase(db: D1Database, region: string, env: Env) {
 
     try {
       await syncTable(db, table, region, env);
+    } catch (error) {
+      console.error(`[${region}] Error syncing table ${table.name}:`, error);
     } finally {
       // Always release the lock
       await releaseLock(db, table.name);
