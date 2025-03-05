@@ -2,14 +2,13 @@
 
 import { ShapeStream, isChangeMessage, isControlMessage, type Offset } from "@electric-sql/client";
 import { 
-  appVersionsSchema,
-  channelsSchema,
-  channelDevicesSchema,
-  appsSchema,
-  orgsSchema,
-  stripeInfoSchema,
-  syncStateSchema,
-  syncLockSchema
+  TABLE_SCHEMAS_TYPES,
+  UUID_COLUMNS,
+  TABLES,
+  TABLE_SCHEMAS,
+  DBSync,
+  TableSchema,
+  SQLiteType,
 } from "./schema.ts";
 
 interface Env {
@@ -36,60 +35,146 @@ interface SyncRequest {
   table: string;
 }
 
-interface TableSchema {
-  name: string;
-  columns: string[];
-  primaryKey: string;
-}
+// Function to convert values based on their type
+function convertValue(value: any, type: SQLiteType): any {
+  if (value === null || value === undefined)
+    return null;
 
-const TABLES: TableSchema[] = [
-  {
-    name: "app_versions",
-    columns: ["id", "owner_org", "app_id", "name", "r2_path", "user_id", "deleted", "external_url", "checksum", "session_key", "storage_provider", "min_update_version", "manifest"],
-    primaryKey: "id"
-  },
-  {
-    name: "channels",
-    columns: ["id", "name", "app_id", "version", "created_by", "owner_org", "public", "disable_auto_update_under_native", "disable_auto_update", "ios", "android", "allow_device_self_set", "allow_emulator", "allow_dev"],
-    primaryKey: "id"
-  },
-  {
-    name: "channel_devices",
-    columns: ["id", "channel_id", "app_id", "device_id", "owner_org"],
-    primaryKey: "id"
-  },
-  {
-    name: "apps",
-    columns: ["id", "app_id", "icon_url", "user_id", "name", "last_version", "retention", "owner_org", "default_upload_channel", "transfer_history"],
-    primaryKey: "id"
-  },
-  {
-    name: "orgs",
-    columns: ["id", "created_by", "logo", "name", "management_email", "customer_id"],
-    primaryKey: "id"
-  },
-  {
-    name: "stripe_info",
-    columns: ["id", "customer_id", "status", "trial_at", "is_good_plan", "mau_exceeded", "storage_exceeded", "bandwidth_exceeded"],
-    primaryKey: "id"
+  switch (type) {
+    case 'INTEGER':
+      // Handle bigint and timestamp values
+      if (typeof value === 'bigint') {
+        return Number(value);
+      }
+      // Convert timestamp to unix timestamp if it's a date string
+      if (typeof value === 'string' && value.includes('T')) {
+        return Math.floor(new Date(value).getTime() / 1000);
+      }
+      return typeof value === 'string' ? Number.parseInt(value) : value;
+    case 'BOOLEAN':
+      return value ? 1 : 0;
+    case 'JSON':
+      if (typeof value === 'string') {
+        // If it's already a JSON string, return it as is
+        try {
+          JSON.parse(value); // Validate it's valid JSON
+          return value;
+        } catch (e) {
+          // Not valid JSON, stringify it
+          return JSON.stringify(value);
+        }
+      }
+      
+      if (Array.isArray(value) && value.length > 0 && 's3_path' in value[0]) {
+        // Store as [prefix, [file_name, file_hash], [file_name, file_hash], ...]
+        const prefix = value[0].s3_path.slice(0, -value[0].file_name.length);
+        return JSON.stringify([
+          prefix,
+          ...value.map((v: any) => [v.file_name, v.file_hash]),
+        ]);
+      }
+      
+      try {
+        return JSON.stringify(value);
+      } catch (e) {
+        console.error("Error stringifying JSON:", e, "Value:", value);
+        return null;
+      }
+    default:
+      return value;
   }
-];
-
-interface DBSync {
-  db: D1Database;
-  region: string;
 }
 
-const TABLE_SCHEMAS = {
-  app_versions: appVersionsSchema,
-  channels: channelsSchema,
-  channel_devices: channelDevicesSchema,
-  apps: appsSchema,
-  orgs: orgsSchema,
-  stripe_info: stripeInfoSchema,
-  sync_state: syncStateSchema,
-  sync_lock: syncLockSchema
-} as const;
+// Clean fields that are not in the D1 table
+function cleanFields(record: any, tableName: string): Record<string, any> {
+  if (!record)
+    return record;
+
+  const schema = TABLE_SCHEMAS_TYPES[tableName];
+  if (!schema) {
+    console.error(`Unknown table: ${tableName}`);
+    return record;
+  }
+
+  // Only keep columns that exist in schema
+  const cleanRecord: Record<string, any> = {};
+  for (const [key, value] of Object.entries(record)) {
+    // Skip if column not in schema
+    if (!(key in schema)) {
+      continue;
+    }
+
+    const type = schema[key];
+    const convertedValue = convertValue(value, type);
+    if (convertedValue !== null && convertedValue !== undefined) {
+      // Make UUIDs lowercase
+      if (UUID_COLUMNS.has(key) && typeof convertedValue === 'string') {
+        cleanRecord[key] = convertedValue.toLowerCase();
+      }
+      else {
+        cleanRecord[key] = convertedValue;
+      }
+    }
+  }
+
+  return cleanRecord;
+}
+
+// Update handleMessage function to use the new schema structure
+function handleMessage(msg: any, table: TableSchema) {
+  const { headers, value } = msg;
+  const tableName = table.name;
+  const columns = table.columns.filter(col => col !== table.primaryKey);
+
+  try {
+    // Validate input
+    if (!value || typeof value !== 'object') {
+      console.error(`Invalid message value for table ${tableName}:`, value);
+      throw new Error(`Invalid message value for table ${tableName}`);
+    }
+
+    // Clean and convert the values
+    const cleanedValue = cleanFields(value, tableName);
+    
+    // Values to insert/update
+    const pkValue = cleanedValue[table.primaryKey];
+    
+    // Handle missing primary key
+    if (pkValue === undefined || pkValue === null) {
+      console.error(`Missing primary key for table ${tableName}:`, value);
+      throw new Error(`Missing primary key for table ${tableName}`);
+    }
+    
+    // Map column values, defaulting to null for missing values
+    const values = columns.map(col => {
+      const val = cleanedValue[col];
+      return val === undefined ? null : val;
+    });
+
+    switch (headers.operation) {
+      case "insert":
+        return {
+          sql: `INSERT OR REPLACE INTO ${tableName} (${table.columns.join(", ")}) VALUES (${table.columns.map(() => "?").join(", ")})`,
+          params: [pkValue, ...values],
+        };
+      case "update":
+        return {
+          sql: `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(", ")} WHERE ${table.primaryKey} = ?`,
+          params: [...values, pkValue],
+        };
+      case "delete":
+        return {
+          sql: `DELETE FROM ${tableName} WHERE ${table.primaryKey} = ?`,
+          params: [pkValue],
+        };
+      default:
+        throw new Error(`Unknown operation: ${headers.operation}`);
+    }
+  } catch (error) {
+    console.error(`Error handling message for table ${tableName}:`, error, "Value:", JSON.stringify(value));
+    throw error;
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
@@ -191,31 +276,6 @@ async function checkAndCreateTables(db: D1Database, region: string) {
   }
 }
 
-function handleMessage(msg: any, table: TableSchema) {
-  const { headers, value } = msg;
-  const columns = table.columns.filter(col => col !== table.primaryKey);
-  // fix bigint issue with D1
-  const values = columns.map(col => typeof value[col] === 'bigint' ? Number(value[col]) : value[col]);
-
-  switch (headers.operation) {
-    case "insert":
-      return {
-        sql: `INSERT OR REPLACE INTO ${table.name} (${table.columns.join(", ")}) VALUES (${table.columns.map(() => "?").join(", ")})`,
-        params: [value[table.primaryKey], ...values],
-      };
-    case "update":
-      return {
-        sql: `UPDATE ${table.name} SET ${columns.map(col => `${col} = ?`).join(", ")} WHERE ${table.primaryKey} = ?`,
-        params: [...values, value[table.primaryKey]],
-      };
-    case "delete":
-      return {
-        sql: `DELETE FROM ${table.name} WHERE ${table.primaryKey} = ?`,
-        params: [value[table.primaryKey]],
-      };
-  }
-}
-
 async function syncTable(db: D1Database, table: TableSchema, region: string, env: Env) {
   const start = Date.now();
   const tableName = table.name;
@@ -252,7 +312,15 @@ async function syncTable(db: D1Database, table: TableSchema, region: string, env
         async (messages) => {
           for (const msg of messages) {
             if (isChangeMessage(msg)) {
-              currentBatch.push(handleMessage(msg, table));
+              try {
+                const sqlOperation = handleMessage(msg, table);
+                if (sqlOperation) {
+                  currentBatch.push(sqlOperation);
+                }
+              } catch (error) {
+                console.error(`[${region}] Error handling message for ${tableName}:`, error);
+                // Continue processing other messages
+              }
             }
             else if (isControlMessage(msg) && msg.headers.control === "up-to-date") {
               finalOffset = stream.lastOffset;
@@ -269,13 +337,22 @@ async function syncTable(db: D1Database, table: TableSchema, region: string, env
     // Apply changes and save offset only if we have changes
     if (currentBatch.length > 0) {
       console.log(`[${region}] Applying ${currentBatch.length} changes to table ${tableName}`);
-      await db.batch(currentBatch);
-      if (finalOffset) {
-        await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset) VALUES (?, ?)")
-          .bind(tableName, finalOffset)
-          .run();
+      try {
+        await db.batch(currentBatch);
+        if (finalOffset) {
+          await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset) VALUES (?, ?)")
+            .bind(tableName, finalOffset)
+            .run();
+        }
+        console.log(`[${region}] Table ${tableName} synced in ${Date.now() - start}ms`);
+      } catch (error) {
+        console.error(`[${region}] Error executing batch for ${tableName}:`, error);
+        // Log a sample of the batch that caused the error
+        const sampleSize = Math.min(currentBatch.length, 3);
+        console.error(`[${region}] Sample of ${sampleSize}/${currentBatch.length} batch items that caused the error:`, 
+          JSON.stringify(currentBatch.slice(0, sampleSize), null, 2));
+        throw error;
       }
-      console.log(`[${region}] Table ${tableName} synced in ${Date.now() - start}ms`);
     } else {
       console.log(`[${region}] No changes for table ${tableName}`);
     }
@@ -319,32 +396,36 @@ async function syncDatabase(db: D1Database, region: string, env: Env) {
 }
 
 async function acquireLock(db: D1Database, tableName: string): Promise<boolean> {
-  const now = new Date().toISOString();
+  const now = Math.floor(Date.now() / 1000); // Unix timestamp
   try {
     // Try to insert a lock record
     await db.prepare(`
-      INSERT INTO sync_lock (id, locked_at, locked_by)
-      VALUES (?, ?, ?)
-    `).bind(tableName, now, 'worker').run();
+      INSERT INTO sync_lock (table_name, locked_at)
+      VALUES (?, ?)
+    `).bind(tableName, now).run();
     return true;
   } catch (error) {
     // If insert fails, check if lock is stale (older than 5 minutes)
     const lock = await db.prepare(`
-      SELECT locked_at FROM sync_lock WHERE id = ?
-    `).bind(tableName).first() as { locked_at: string } | undefined;
+      SELECT locked_at FROM sync_lock WHERE table_name = ?
+    `).bind(tableName).first() as { locked_at: number } | undefined;
     
     if (lock) {
-      const lockTime = new Date(lock.locked_at);
-      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+      const fiveMinutesAgo = Math.floor((Date.now() - 5 * 60 * 1000) / 1000);
       
-      if (lockTime < fiveMinutesAgo) {
+      if (lock.locked_at < fiveMinutesAgo) {
         // Lock is stale, try to update it
-        await db.prepare(`
-          UPDATE sync_lock 
-          SET locked_at = ?, locked_by = ?
-          WHERE id = ?
-        `).bind(now, 'worker', tableName).run();
-        return true;
+        try {
+          await db.prepare(`
+            UPDATE sync_lock 
+            SET locked_at = ? 
+            WHERE table_name = ?
+          `).bind(now, tableName).run();
+          return true;
+        } catch (error) {
+          console.error(`Error updating stale lock for ${tableName}:`, error);
+          return false;
+        }
       }
     }
     return false;
@@ -352,9 +433,7 @@ async function acquireLock(db: D1Database, tableName: string): Promise<boolean> 
 }
 
 async function releaseLock(db: D1Database, tableName: string): Promise<void> {
-  await db.prepare(`
-    DELETE FROM sync_lock WHERE id = ?
-  `).bind(tableName).run();
+  await db.prepare(`DELETE FROM sync_lock WHERE table_name = ?`).bind(tableName).run();
 }
 
 async function handleSync(env: Env) {
