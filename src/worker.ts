@@ -110,17 +110,17 @@ async function checkAndCreateTables(db: D1Database, region: string) {
   const start = Date.now();
   try {
     // Check each table with a simple SELECT
-    for (const table of TABLES) {
+    for (const table of Object.keys(TABLE_SCHEMAS)) {
       try {
         // Try to select from the table
-        await db.prepare(`SELECT 1 FROM ${table.name} LIMIT 1`).first();
+        await db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).first();
       } catch (error) {
         // If table doesn't exist, create it
         if (error instanceof Error && error.message.includes('no such table')) {
-          console.log(`[${region}] Creating table ${table.name}`);
-          await db.exec(TABLE_SCHEMAS[table.name as keyof typeof TABLE_SCHEMAS]);
+          console.log(`[${region}] Creating table ${table}`);
+          await db.exec(TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS]);
         } else {
-          console.error(`[${region}] Error checking/creating table ${table.name}:`, error);
+          console.error(`[${region}] Error checking/creating table ${table}:`, error);
           throw error;
         }
       }
