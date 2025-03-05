@@ -1,6 +1,7 @@
 {
   "name": "electric-d1-sync",
   "main": "src/worker.ts",
+  "custom_domains": ["sync.capgo.app"],
   "route": {
     "pattern": "sync.capgo.app",
     "custom_domain": true
