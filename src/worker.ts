@@ -124,7 +124,7 @@ export default {
       const promises = [];
       
       // Get the worker URL from the cron event
-      const workerUrl = new URL("https://electric-d1-sync.workers.dev");
+      const workerUrl = new URL("https://sync.capgo.app");
       
       for (const { region } of dbs) {
         for (const table of TABLES) {

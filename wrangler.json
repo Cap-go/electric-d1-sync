@@ -40,5 +40,6 @@
   ],
   "triggers": {
     "crons": ["*/5 * * * *"]
-  }
+  },
+  "custom_domains": ["sync.capgo.app/"]
 } 
