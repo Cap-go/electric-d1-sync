@@ -117,8 +117,10 @@ async function checkAndCreateTables(db: D1Database, region: string) {
       } catch (error) {
         // If table doesn't exist, create it
         if (error instanceof Error && error.message.includes('no such table')) {
+          console.log(`[${region}] Creating table ${table.name}`);
           await db.exec(TABLE_SCHEMAS[table.name as keyof typeof TABLE_SCHEMAS]);
         } else {
+          console.error(`[${region}] Error checking/creating table ${table.name}:`, error);
           throw error;
         }
       }
