@@ -144,7 +144,7 @@ export default {
           // Execute the fetch but don't wait for it (fire and forget)
           const promise = fetch(req).then(resp => {
             if (!resp.ok) {
-              console.error(`Error syncing ${table.name} in ${region}: ${resp.status} ${resp.statusText}`);
+              console.error(`Error syncing ${table.name} in ${region} status: ${resp.status} ${resp.body}`);
             }
           }).catch(err => {
             console.error(`Error triggering sync for ${table.name} in ${region}:`, err);
@@ -530,7 +530,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
     ctx.waitUntil(
       syncTable(db, table, region, env)
         .catch(error => {
-          console.error(`Error syncing ${tableName} in ${region}:`, error);
+          console.error(`Error syncing ${tableName} in ${region} Error: ${error}`);
         })
     );
     
