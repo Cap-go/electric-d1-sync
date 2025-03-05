@@ -142,9 +142,10 @@ export default {
           });
           
           // Execute the fetch but don't wait for it (fire and forget)
-          const promise = fetch(req).then(resp => {
+          const promise = fetch(req).then(async (resp) => {
             if (!resp.ok) {
-              console.error(`Error syncing ${table.name} in ${region} status: ${resp.status} ${resp.body}`);
+              const body = await resp.text();
+              console.error(`Error syncing ${table.name} in ${region} status: ${resp.status} ${body}`);
             }
           }).catch(err => {
             console.error(`Error triggering sync for ${table.name} in ${region}:`, err);
