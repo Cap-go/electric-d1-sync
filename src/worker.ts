@@ -223,6 +223,7 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
       params: {
         table: tableName,
         replica: "full",
+        columns: table.columns,
         source_id: env.ELECTRIC_SOURCE_ID,
         source_secret: env.ELECTRIC_SOURCE_SECRET,
       },
@@ -236,6 +237,7 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
     await new Promise<void>((resolve, reject) => {
       stream.subscribe(
         async (messages) => {
+          console.log(`Received ${messages.length} messages for table ${tableName}`);
           for (const msg of messages) {
             if (isChangeMessage(msg)) {
               try {
@@ -253,6 +255,7 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
               resolve();
             }
           }
+          console.log(`Processed ${messages.length} messages for table ${tableName}`);
         },
         (error: Error) => {
           reject(error);
