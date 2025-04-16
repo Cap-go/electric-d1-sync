@@ -241,6 +241,10 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
           for (const msg of messages) {
             if (isChangeMessage(msg)) {
               try {
+                console.log(`Processing message for ${tableName}:`, {
+                  operation: msg.headers.operation,
+                  value: msg.value
+                });
                 const sqlOperation = handleMessage(msg, table);
                 if (sqlOperation) {
                   currentBatch.push(sqlOperation);
@@ -267,7 +271,20 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
     if (currentBatch.length > 0) {
       console.log(`Applying ${currentBatch.length} changes to table ${tableName}`);
       try {
+        // Log first few SQL statements for debugging
+        const sampleSize = Math.min(currentBatch.length, 3);
+        console.log(`Sample SQL statements (${sampleSize}/${currentBatch.length}):`, 
+          currentBatch.slice(0, sampleSize).map(op => ({
+            sql: op.sql,
+            params: op.params
+          })));
+        
         await db.batch(currentBatch);
+        
+        // Verify changes were applied
+        const count = await db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
+        console.log(`Current row count in ${tableName}:`, count?.count);
+        
         if (finalOffset) {
           await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset) VALUES (?, ?)")
             .bind(tableName, finalOffset)
