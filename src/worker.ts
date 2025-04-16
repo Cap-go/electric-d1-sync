@@ -191,7 +191,7 @@ async function ensureTableExists(db: D1Database, table: string) {
     // If table doesn't exist, create it
     if (error instanceof Error && error.message.includes('no such table')) {
       const schema = TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS];
-      console.log(`Creating table ${table} ${schema}`);
+      console.log(`Creating table ${table} with query "${schema}"`);
       await db.exec(schema);
       console.log(`Table ${table} created`);
     } else {
