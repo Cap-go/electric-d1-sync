@@ -20,7 +20,7 @@ export const UUID_COLUMNS = new Set([
 
 // Table definitions - single source of truth
 export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
-  app_versions: {
+    app_versions: {
     primaryKey: 'id',
     columns: {
       id: 'INTEGER',
@@ -36,8 +36,8 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       storage_provider: 'TEXT',
       min_update_version: 'TEXT',
     }
-  },
-  channels: {
+    },
+    channels: {
     primaryKey: 'id',
     columns: {
       id: 'INTEGER',
@@ -55,8 +55,8 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       allow_emulator: 'BOOLEAN',
       allow_dev: 'BOOLEAN',
     }
-  },
-  channel_devices: {
+    },
+    channel_devices: {
     primaryKey: 'id',
     columns: {
       id: 'INTEGER',
@@ -65,8 +65,8 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       device_id: 'TEXT',
       owner_org: 'TEXT',
     }
-  },
-  apps: {
+    },
+    apps: {
     primaryKey: 'id',
     columns: {
       id: 'TEXT',
@@ -80,8 +80,8 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       default_upload_channel: 'TEXT',
       transfer_history: 'JSON',
     }
-  },
-  orgs: {
+    },
+    orgs: {
     primaryKey: 'id',
     columns: {
       id: 'TEXT',
@@ -91,8 +91,8 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       management_email: 'TEXT',
       customer_id: 'TEXT',
     }
-  },
-  stripe_info: {
+    },
+    stripe_info: {
     primaryKey: 'id',
     columns: {
       id: 'INTEGER',
@@ -194,61 +194,43 @@ function generateIndexesSQL(tableName: string, tableDef: TableDefinition): strin
 }
 
 // Generate SQL schema statements
-export const appVersionsSchema = sqltag`
-${generateCreateTableSQL('app_versions', TABLE_DEFINITIONS.app_versions)}
+export const appVersionsSchema = `${generateCreateTableSQL('app_versions', TABLE_DEFINITIONS.app_versions)}
 
-${generateIndexesSQL('app_versions', TABLE_DEFINITIONS.app_versions).join('\n')}
-`.text;
+${generateIndexesSQL('app_versions', TABLE_DEFINITIONS.app_versions).join('\n')}`;
 
-export const channelsSchema = sqltag`
-${generateCreateTableSQL('channels', TABLE_DEFINITIONS.channels)}
+export const channelsSchema = `${generateCreateTableSQL('channels', TABLE_DEFINITIONS.channels)}
 
-${generateIndexesSQL('channels', TABLE_DEFINITIONS.channels).join('\n')}
-`.text;
+${generateIndexesSQL('channels', TABLE_DEFINITIONS.channels).join('\n')}`;
 
-export const channelDevicesSchema = sqltag`
-${generateCreateTableSQL('channel_devices', TABLE_DEFINITIONS.channel_devices)}
+export const channelDevicesSchema = `${generateCreateTableSQL('channel_devices', TABLE_DEFINITIONS.channel_devices)}
 
-${generateIndexesSQL('channel_devices', TABLE_DEFINITIONS.channel_devices).join('\n')}
-`.text;
+${generateIndexesSQL('channel_devices', TABLE_DEFINITIONS.channel_devices).join('\n')}`;
 
-export const appsSchema = sqltag`
-${generateCreateTableSQL('apps', TABLE_DEFINITIONS.apps)}
+export const appsSchema = `${generateCreateTableSQL('apps', TABLE_DEFINITIONS.apps)}
 
-${generateIndexesSQL('apps', TABLE_DEFINITIONS.apps).join('\n')}
-`.text;
+${generateIndexesSQL('apps', TABLE_DEFINITIONS.apps).join('\n')}`;
 
-export const orgsSchema = sqltag`
-${generateCreateTableSQL('orgs', TABLE_DEFINITIONS.orgs)}
+export const orgsSchema = `${generateCreateTableSQL('orgs', TABLE_DEFINITIONS.orgs)}
 
-${generateIndexesSQL('orgs', TABLE_DEFINITIONS.orgs).join('\n')}
-`.text;
+${generateIndexesSQL('orgs', TABLE_DEFINITIONS.orgs).join('\n')}`;
 
-export const stripeInfoSchema = sqltag`
-${generateCreateTableSQL('stripe_info', TABLE_DEFINITIONS.stripe_info)}
+export const stripeInfoSchema = `${generateCreateTableSQL('stripe_info', TABLE_DEFINITIONS.stripe_info)}
 
-${generateIndexesSQL('stripe_info', TABLE_DEFINITIONS.stripe_info).join('\n')}
-`.text;
+${generateIndexesSQL('stripe_info', TABLE_DEFINITIONS.stripe_info).join('\n')}`;
 
-export const manifestSchema = sqltag`
-${generateCreateTableSQL('manifest', TABLE_DEFINITIONS.manifest)}
+export const manifestSchema = `${generateCreateTableSQL('manifest', TABLE_DEFINITIONS.manifest)}
 
-${generateIndexesSQL('manifest', TABLE_DEFINITIONS.manifest).join('\n')}
-`.text;
+${generateIndexesSQL('manifest', TABLE_DEFINITIONS.manifest).join('\n')}`;
 
-export const syncStateSchema = sqltag`
-CREATE TABLE IF NOT EXISTS sync_state (
+export const syncStateSchema = `CREATE TABLE IF NOT EXISTS sync_state (
     table_name TEXT PRIMARY KEY,
     last_offset TEXT NOT NULL
-);
-`.text;
+);`;
 
-export const syncLockSchema = sqltag`
-CREATE TABLE IF NOT EXISTS sync_lock (
+export const syncLockSchema = `CREATE TABLE IF NOT EXISTS sync_lock (
     table_name TEXT PRIMARY KEY,
     locked_at INTEGER NOT NULL
-);
-`.text;
+);`;
 
 // Group all schemas for easy access
 export const TABLE_SCHEMAS = {
@@ -262,3 +244,4 @@ export const TABLE_SCHEMAS = {
   sync_state: syncStateSchema,
   sync_lock: syncLockSchema
 } as const;
+  

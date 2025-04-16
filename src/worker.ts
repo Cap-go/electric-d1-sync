@@ -187,12 +187,13 @@ async function ensureTableExists(db: D1Database, table: string) {
     // Try to select from the table
     await db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).first();
   } catch (error) {
-    console.log(`Table ${table} doesn't exist`);
     // If table doesn't exist, create it
     if (error instanceof Error && error.message.includes('no such table')) {
       const schema = TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS];
-      console.log(`Creating table ${table} with query "${schema}"`);
-      await db.exec(schema);
+      // Format the SQL query to remove newlines and extra spaces
+      const formattedSchema = schema.replace(/\s+/g, ' ').trim();
+      console.log(`Creating table ${table} with query "${formattedSchema}"`);
+      await db.exec(formattedSchema);
       console.log(`Table ${table} created`);
     } else {
       console.error(`Error checking/creating table ${table}:`, error);
