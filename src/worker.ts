@@ -6,18 +6,12 @@ import {
   UUID_COLUMNS,
   TABLES,
   TABLE_SCHEMAS,
-  DBSync,
   TableSchema,
   SQLiteType,
 } from "./schema.ts";
 
 interface Env {
-  DB_ENA: D1Database;  // East North America
-  DB_WNA: D1Database;  // West North America
-  DB_WEU: D1Database;  // West Europe
-  DB_EEU: D1Database;  // East Europe
-  DB_ASIA: D1Database; // Asia
-  DB_OC: D1Database;   // Oceania
+  DB: D1Database;
   ELECTRIC_URL: string;
   WEBHOOK_SECRET: string;
   ELECTRIC_SOURCE_ID: string;
@@ -25,13 +19,11 @@ interface Env {
 }
 
 interface NukeRequest {
-  type: 'all' | 'db' | 'table';
-  db?: string;
+  type: 'all' | 'table';
   table?: string;
 }
 
 interface SyncRequest {
-  region: string;
   table: string;
 }
 
@@ -176,121 +168,52 @@ function handleMessage(msg: any, table: TableSchema) {
   }
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(request.url);
-    
-    if (url.pathname === "/nuke") {
-      return handleNuke(request, env);
-    }
-    
-    if (url.pathname === "/sync") {
-      return handleSyncRequest(request, env, ctx);
-    }
-    
-    return new Response("Not found", { status: 404 });
-  },
-
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    try {
-      // Initialize all databases first
-      const dbs: DBSync[] = [
-        { db: env.DB_ENA, region: "ENA" },
-        { db: env.DB_WNA, region: "WNA" },
-        { db: env.DB_WEU, region: "WEU" },
-        { db: env.DB_EEU, region: "EEU" },
-        { db: env.DB_ASIA, region: "ASIA" },
-        { db: env.DB_OC, region: "OC" },
-      ];
-      
-      await Promise.all(dbs.map(({ db, region }) => checkAndCreateTables(db, region)));
-      
-      // Trigger individual sync requests for each table and database
-      const promises = [];
-      
-      // Get the worker URL from the cron event
-      const workerUrl = new URL("https://sync.capgo.app");
-      
-      for (const { region } of dbs) {
-        for (const table of TABLES) {
-          // Use fetch to call our own /sync endpoint
-          const syncUrl = new URL(workerUrl);
-          syncUrl.pathname = "/sync";
-          
-          const req = new Request(syncUrl.toString(), {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-webhook-signature": env.WEBHOOK_SECRET,
-            },
-            body: JSON.stringify({ region, table: table.name }),
-          });
-          
-          // Execute the fetch but don't wait for it (fire and forget)
-          const promise = fetch(req).then(async (resp) => {
-            if (!resp.ok) {
-              const body = await resp.text();
-              console.error(`Error syncing ${table.name} in ${region} status: ${resp.status} ${body}`);
-            }
-          }).catch(err => {
-            console.error(`Error triggering sync for ${table.name} in ${region}:`, err);
-          });
-          
-          promises.push(promise);
-        }
-      }
-      
-      // Wait for all triggers to be sent (not for them to complete)
-      await Promise.all(promises);
-      console.log(`Triggered sync for all tables and databases`);
-    } catch (error) {
-      console.error("Error during scheduled sync:", error);
-    }
-  }
-};
-
-async function checkAndCreateTables(db: D1Database, region: string) {
+async function checkAndCreateTables(db: D1Database) {
   const start = Date.now();
   try {
     // Check each table with a simple SELECT
     for (const table of Object.keys(TABLE_SCHEMAS)) {
-      try {
-        // Try to select from the table
-        await db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).first();
-      } catch (error) {
-        // If table doesn't exist, create it
-        if (error instanceof Error && error.message.includes('no such table')) {
-          const schema = TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS];
-          console.log(`[${region}] Creating table ${table} ${schema}`);
-          await db.exec(schema);
-        } else {
-          console.error(`[${region}] Error checking/creating table ${table}:`, error);
-          throw error;
-        }
-      }
+      await ensureTableExists(db, table);
     }
-    console.log(`[${region}] Tables checked/created in ${Date.now() - start}ms`);
+    console.log(`Tables checked/created in ${Date.now() - start}ms`);
   } catch (error) {
-    console.error(`[${region}] Error initializing database:`, error);
+    console.error(`Error initializing database:`, error);
     throw error;
   }
 }
 
-async function syncTable(db: D1Database, table: TableSchema, region: string, env: Env) {
+async function ensureTableExists(db: D1Database, table: string) {
+  try {
+    // Try to select from the table
+    await db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).first();
+  } catch (error) {
+    // If table doesn't exist, create it
+    if (error instanceof Error && error.message.includes('no such table')) {
+      const schema = TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS];
+      console.log(`Creating table ${table} ${schema}`);
+      await db.exec(schema);
+    } else {
+      console.error(`Error checking/creating table ${table}:`, error);
+      throw error;
+    }
+  }
+}
+
+async function syncTable(db: D1Database, table: TableSchema, env: Env) {
   const start = Date.now();
   const tableName = table.name;
   
   // Try to acquire lock for this table
   const hasLock = await acquireLock(db, tableName);
   if (!hasLock) {
-    console.log(`[${region}] Another sync is already running for table ${tableName}, skipping`);
+    console.log(`Another sync is already running for table ${tableName}, skipping`);
     return;
   }
   
   try {
     const lastKnownOffset = await getLastOffset(db, tableName);
     
-    console.log(`[${region}] Starting sync for table ${tableName} from offset ${lastKnownOffset || 'beginning'}`);
+    console.log(`Starting sync for table ${tableName} from offset ${lastKnownOffset || 'beginning'}`);
     
     const stream = new ShapeStream({
       url: env.ELECTRIC_URL,
@@ -318,7 +241,7 @@ async function syncTable(db: D1Database, table: TableSchema, region: string, env
                   currentBatch.push(sqlOperation);
                 }
               } catch (error) {
-                console.error(`[${region}] Error handling message for ${tableName}:`, error);
+                console.error(`Error handling message for ${tableName}:`, error);
                 // Continue processing other messages
               }
             }
@@ -336,7 +259,7 @@ async function syncTable(db: D1Database, table: TableSchema, region: string, env
       
     // Apply changes and save offset only if we have changes
     if (currentBatch.length > 0) {
-      console.log(`[${region}] Applying ${currentBatch.length} changes to table ${tableName}`);
+      console.log(`Applying ${currentBatch.length} changes to table ${tableName}`);
       try {
         await db.batch(currentBatch);
         if (finalOffset) {
@@ -344,55 +267,55 @@ async function syncTable(db: D1Database, table: TableSchema, region: string, env
             .bind(tableName, finalOffset)
             .run();
         }
-        console.log(`[${region}] Table ${tableName} synced in ${Date.now() - start}ms`);
+        console.log(`Table ${tableName} synced in ${Date.now() - start}ms`);
       } catch (error) {
-        console.error(`[${region}] Error executing batch for ${tableName}:`, error);
+        console.error(`Error executing batch for ${tableName}:`, error);
         // Log a sample of the batch that caused the error
         const sampleSize = Math.min(currentBatch.length, 3);
-        console.error(`[${region}] Sample of ${sampleSize}/${currentBatch.length} batch items that caused the error:`, 
+        console.error(`Sample of ${sampleSize}/${currentBatch.length} batch items that caused the error:`, 
           JSON.stringify(currentBatch.slice(0, sampleSize), null, 2));
         throw error;
       }
     } else {
-      console.log(`[${region}] No changes for table ${tableName}`);
+      console.log(`No changes for table ${tableName}`);
     }
   } catch (error) {
-    console.error(`[${region}] Error syncing table ${tableName}:`, error);
+    console.error(`Error syncing table ${tableName}:`, error);
     throw error;
   } finally {
     // Always release the lock
     try {
       await releaseLock(db, tableName);
-      console.log(`[${region}] Released lock for ${tableName}`);
+      console.log(`Released lock for ${tableName}`);
     } catch (error) {
-      console.error(`[${region}] Error releasing lock for ${tableName}:`, error);
+      console.error(`Error releasing lock for ${tableName}:`, error);
     }
   }
 }
 
-async function syncDatabase(db: D1Database, region: string, env: Env) {
+async function syncDatabase(db: D1Database, env: Env) {
   const start = Date.now();
-  console.log(`[${region}] Starting database sync`);
+  console.log(`Starting database sync`);
   
   for (const table of TABLES) {
     // Try to acquire lock for this table
     const hasLock = await acquireLock(db, table.name);
     if (!hasLock) {
-      console.log(`[${region}] Another sync is already running for table ${table.name}, skipping`);
+      console.log(`Another sync is already running for table ${table.name}, skipping`);
       continue;
     }
 
     try {
-      await syncTable(db, table, region, env);
+      await syncTable(db, table, env);
     } catch (error) {
-      console.error(`[${region}] Error syncing table ${table.name}:`, error);
+      console.error(`Error syncing table ${table.name}:`, error);
     } finally {
       // Always release the lock
       await releaseLock(db, table.name);
     }
   }
   
-  console.log(`[${region}] Database sync completed in ${Date.now() - start}ms`);
+  console.log(`Database sync completed in ${Date.now() - start}ms`);
 }
 
 async function acquireLock(db: D1Database, tableName: string): Promise<boolean> {
@@ -438,25 +361,32 @@ async function releaseLock(db: D1Database, tableName: string): Promise<void> {
 
 async function handleSync(env: Env) {
   const start = Date.now();
-  console.log('Starting global sync');
+  console.log('Starting sync');
   
-  const dbs: DBSync[] = [
-    { db: env.DB_ENA, region: "ENA" },
-    { db: env.DB_WNA, region: "WNA" },
-    { db: env.DB_WEU, region: "WEU" },
-    { db: env.DB_EEU, region: "EEU" },
-    { db: env.DB_ASIA, region: "ASIA" },
-    { db: env.DB_OC, region: "OC" },
-  ];
-
   try {
-    // Initialize all databases
-    await Promise.all(dbs.map(({ db, region }) => checkAndCreateTables(db, region)));
+    // Initialize database
+    await checkAndCreateTables(env.DB);
     
-    // Sync all databases in parallel
-    await Promise.all(dbs.map(({ db, region }) => syncDatabase(db, region, env)));
+    // Sync all tables
+    for (const table of TABLES) {
+      // Try to acquire lock for this table
+      const hasLock = await acquireLock(env.DB, table.name);
+      if (!hasLock) {
+        console.log(`Another sync is already running for table ${table.name}, skipping`);
+        continue;
+      }
+
+      try {
+        await syncTable(env.DB, table, env);
+      } catch (error) {
+        console.error(`Error syncing table ${table.name}:`, error);
+      } finally {
+        // Always release the lock
+        await releaseLock(env.DB, table.name);
+      }
+    }
     
-    console.log(`Global sync completed in ${Date.now() - start}ms`);
+    console.log(`Sync completed in ${Date.now() - start}ms`);
   } catch (error) {
     console.error('Error during sync:', error);
     throw error;
@@ -479,93 +409,93 @@ async function handleNuke(request: Request, env: Env) {
   }
 
   const body = await request.json() as NukeRequest;
-  const dbs: DBSync[] = [
-    { db: env.DB_ENA, region: "ENA" },
-    { db: env.DB_WNA, region: "WNA" },
-    { db: env.DB_WEU, region: "WEU" },
-    { db: env.DB_EEU, region: "EEU" },
-    { db: env.DB_ASIA, region: "ASIA" },
-    { db: env.DB_OC, region: "OC" },
-  ];
 
   try {
-    // First, try to acquire locks on all tables in all databases
-    const lockPromises = dbs.flatMap(({ db, region }) => 
-      TABLES.map(async (table) => {
-        const hasLock = await acquireLock(db, table.name);
-        if (!hasLock) {
-          throw new Error(`Cannot acquire lock for table ${table.name} in ${region}`);
-        }
-        return { db, region, table };
-      })
-    );
-
-    // Wait for all locks to be acquired
-    await Promise.all(lockPromises);
+    // Initialize database to ensure the sync tables exist
+    await checkAndCreateTables(env.DB);
+    
+    // For 'all' nuke type, no need to acquire locks as we'll delete everything
+    if (body.type === 'table') {
+      // Only acquire locks when nuking specific tables
+      const tableName = body.table;
+      if (!tableName || !TABLES.some(t => t.name === tableName)) {
+        return new Response(`Invalid table: ${tableName}`, { status: 400 });
+      }
+      
+      // Try to acquire lock for the specific table
+      const hasLock = await acquireLock(env.DB, tableName);
+      if (!hasLock) {
+        return new Response(`Cannot acquire lock for table ${tableName}`, { status: 409 });
+      }
+    }
 
     // Now proceed with nuking
     switch (body.type) {
       case 'all':
-        await Promise.all(dbs.map(({ db, region }) => nukeDatabase(db, region)));
-        return new Response("All databases nuked", { status: 200 });
-
-      case 'db':
-        if (!body.db) {
-          return new Response("Database name required", { status: 400 });
-        }
-        const db = dbs.find(d => d.region.toLowerCase() === body.db?.toLowerCase());
-        if (!db) {
-          return new Response("Database not found", { status: 404 });
-        }
-        await nukeDatabase(db.db, db.region);
-        return new Response(`Database ${db.region} nuked`, { status: 200 });
-
+        await nukeDatabase(env.DB);
+        return new Response("Database nuked", { status: 200 });
+      
       case 'table':
-        if (!body.db || !body.table) {
-          return new Response("Database and table names required", { status: 400 });
-        }
-        const targetDb = dbs.find(d => d.region.toLowerCase() === body.db?.toLowerCase());
-        if (!targetDb) {
-          return new Response("Database not found", { status: 404 });
-        }
-        if (!TABLES.find(t => t.name === body.table)) {
-          return new Response("Table not found", { status: 404 });
-        }
-        await nukeTable(targetDb.db, body.table, targetDb.region);
-        return new Response(`Table ${body.table} nuked from ${targetDb.region}`, { status: 200 });
-
+        const tableName = body.table!;
+        await nukeTable(env.DB, tableName);
+        // Release the lock for this table
+        await releaseLock(env.DB, tableName);
+        return new Response(`Table ${tableName} nuked`, { status: 200 });
+      
       default:
-        return new Response("Invalid nuke type", { status: 400 });
+        return new Response(`Invalid nuke type: ${body.type}`, { status: 400 });
     }
   } catch (error) {
     console.error("Error during nuke operation:", error);
     return new Response(error instanceof Error ? error.message : "Internal server error", { status: 500 });
-  } finally {
-    // Release all locks
-    await Promise.all(dbs.flatMap(({ db, region }) => 
-      TABLES.map(table => releaseLock(db, table.name))
-    ));
   }
 }
 
-async function nukeDatabase(db: D1Database, region: string) {
-  console.log(`[${region}] Nuking database`);
-  for (const table of TABLES) {
-    await nukeTable(db, table.name, region);
-  }
-  // Clear sync state
+async function nukeDatabase(db: D1Database) {
+  console.log(`Nuking database`);
+  
+  // First clear the sync tables
   await db.prepare("DELETE FROM sync_state").run();
   await db.prepare("DELETE FROM sync_lock").run();
-  console.log(`[${region}] Database nuked`);
+  
+  // Then nuke all actual data tables
+  for (const table of TABLES) {
+    await nukeTable(db, table.name, false); // Don't touch sync_state during table nuke
+  }
+  
+  console.log(`Database nuked`);
 }
 
-async function nukeTable(db: D1Database, tableName: string, region: string) {
-  console.log(`[${region}] Nuking table ${tableName}`);
+async function nukeTable(db: D1Database, tableName: string, updateSyncState = true) {
+  console.log(`Nuking table ${tableName}`);
+  
   // Drop the table and recreate it
   await db.prepare(`DROP TABLE IF EXISTS ${tableName}`).run();
   await db.exec(TABLE_SCHEMAS[tableName as keyof typeof TABLE_SCHEMAS]);
-  await db.prepare("DELETE FROM sync_state WHERE table_name = ?").bind(tableName).run();
-  console.log(`[${region}] Table ${tableName} nuked`);
+  
+  // Only update sync_state if this is a single table nuke (not part of a database nuke)
+  if (updateSyncState) {
+    await db.prepare("DELETE FROM sync_state WHERE table_name = ?").bind(tableName).run();
+  }
+  
+  console.log(`Table ${tableName} nuked`);
+}
+
+// This function checks and creates a specific table and sync tables
+async function checkAndCreateSpecificTable(db: D1Database, tableName: string) {
+  const start = Date.now();
+  const tablesToCheck = ['sync_state', 'sync_lock', tableName];
+  
+  try {
+    // Check and create sync_state and sync_lock tables, plus the specific table
+    for (const table of tablesToCheck) {
+      await ensureTableExists(db, table);
+    }
+    console.log(`Table ${tableName} and sync tables checked/created in ${Date.now() - start}ms`);
+  } catch (error) {
+    console.error(`Error initializing table ${tableName}:`, error);
+    throw error;
+  }
 }
 
 async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionContext) {
@@ -583,22 +513,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
   try {
     // Parse request body
     const body = await request.json() as SyncRequest;
-    const { region, table: tableName } = body;
-    
-    // Validate region
-    const dbMap: Record<string, D1Database> = {
-      "ENA": env.DB_ENA,
-      "WNA": env.DB_WNA,
-      "WEU": env.DB_WEU,
-      "EEU": env.DB_EEU,
-      "ASIA": env.DB_ASIA,
-      "OC": env.DB_OC,
-    };
-    
-    const db = dbMap[region];
-    if (!db) {
-      return new Response(`Invalid region: ${region}`, { status: 400 });
-    }
+    const { table: tableName } = body;
     
     // Validate table
     const table = TABLES.find(t => t.name === tableName);
@@ -606,18 +521,72 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
       return new Response(`Invalid table: ${tableName}`, { status: 400 });
     }
     
+    // Ensure the specific table and sync tables exist
+    await checkAndCreateSpecificTable(env.DB, tableName);
+    
     // Run the sync in the background
     ctx.waitUntil(
-      syncTable(db, table, region, env)
+      syncTable(env.DB, table, env)
         .catch(error => {
-          console.error(`Error syncing ${tableName} in ${region} Error: ${error}`);
+          console.error(`Error syncing ${tableName}: ${error}`);
         })
     );
     
     // Return success immediately while the sync continues in the background
-    return new Response(`Sync started for ${tableName} in ${region}`, { status: 202 });
+    return new Response(`Sync started for ${tableName}`, { status: 202 });
   } catch (error) {
     console.error("Error handling sync request:", error);
     return new Response(error instanceof Error ? error.message : "Internal server error", { status: 500 });
   }
 }
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+    
+    if (url.pathname === "/nuke") {
+      return handleNuke(request, env);
+    }
+    
+    if (url.pathname === "/sync") {
+      return handleSyncRequest(request, env, ctx);
+    }
+    
+    return new Response("Not found", { status: 404 });
+  },
+
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    try {
+      // Initialize database first
+      await checkAndCreateTables(env.DB);
+      
+      // Trigger individual sync requests for each table
+      const promises = [];
+      
+      // Get the worker URL from the cron event
+      const workerUrl = new URL("https://sync.capgo.app");
+      
+      for (const table of TABLES) {
+        const syncUrl = new URL("/sync", workerUrl);
+        promises.push(
+          fetch(syncUrl.toString(), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-webhook-signature": env.WEBHOOK_SECRET
+            },
+            body: JSON.stringify({
+              table: table.name
+            })
+          })
+        );
+      }
+      
+      // Wait for all triggers to be sent (not for them to complete)
+      await Promise.all(promises);
+      console.log(`Triggered sync for all tables`);
+    } catch (error) {
+      console.error("Error during scheduled sync:", error);
+    }
+  }
+};

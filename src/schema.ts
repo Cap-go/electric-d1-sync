@@ -35,7 +35,6 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       session_key: 'TEXT',
       storage_provider: 'TEXT',
       min_update_version: 'TEXT',
-      manifest: 'JSON',
     }
   },
   channels: {
@@ -104,8 +103,18 @@ export const TABLE_DEFINITIONS: Record<string, TableDefinition> = {
       mau_exceeded: 'BOOLEAN',
       storage_exceeded: 'BOOLEAN',
       bandwidth_exceeded: 'BOOLEAN',
-    }
+    },
   },
+  manifest: {
+    primaryKey: 'id',
+    columns: {
+      id: 'INTEGER',
+      app_version_id: 'INTEGER',
+      file_name: 'TEXT',
+      s3_path: 'TEXT',
+      file_hash: 'TEXT',
+    }
+  }
 };
 
 // Derived type for compatibility with existing code
@@ -221,6 +230,12 @@ ${generateCreateTableSQL('stripe_info', TABLE_DEFINITIONS.stripe_info)}
 ${generateIndexesSQL('stripe_info', TABLE_DEFINITIONS.stripe_info).join('\n')}
 `.text;
 
+export const manifestSchema = sqltag`
+${generateCreateTableSQL('manifest', TABLE_DEFINITIONS.manifest)}
+
+${generateIndexesSQL('manifest', TABLE_DEFINITIONS.manifest).join('\n')}
+`.text;
+
 export const syncStateSchema = sqltag`
 CREATE TABLE IF NOT EXISTS sync_state (
     table_name TEXT PRIMARY KEY,
@@ -243,12 +258,7 @@ export const TABLE_SCHEMAS = {
   apps: appsSchema,
   orgs: orgsSchema,
   stripe_info: stripeInfoSchema,
+  manifest: manifestSchema,
   sync_state: syncStateSchema,
   sync_lock: syncLockSchema
 } as const;
-
-export interface DBSync {
-  db: D1Database;
-  region: string;
-}
-  
