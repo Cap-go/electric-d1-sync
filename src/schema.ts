@@ -224,12 +224,14 @@ ${generateIndexesSQL('manifest', TABLE_DEFINITIONS.manifest).join('\n')}`;
 
 export const syncStateSchema = `CREATE TABLE IF NOT EXISTS sync_state (
     table_name TEXT PRIMARY KEY,
-    last_offset TEXT NOT NULL
+    last_offset TEXT NOT NULL,
+    shape_handle TEXT
 );`;
 
 export const syncLockSchema = `CREATE TABLE IF NOT EXISTS sync_lock (
     table_name TEXT PRIMARY KEY,
-    locked_at INTEGER NOT NULL
+    locked_at INTEGER NOT NULL,
+    lock_id TEXT NOT NULL
 );`;
 
 // Group all schemas for easy access

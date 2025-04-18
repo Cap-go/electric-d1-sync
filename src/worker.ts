@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import { ShapeStream, isChangeMessage, isControlMessage, type Offset } from "@electric-sql/client";
+import { ShapeStream, isChangeMessage, isControlMessage, type Offset, type Row } from "@electric-sql/client";
 import { 
   TABLE_SCHEMAS_TYPES,
   UUID_COLUMNS,
@@ -16,6 +16,7 @@ interface Env {
   WEBHOOK_SECRET: string;
   ELECTRIC_SOURCE_ID: string;
   ELECTRIC_SOURCE_SECRET: string;
+  WORKER_BASE_URL?: string; // Add optional base URL for self-fetch
 }
 
 interface NukeRequest {
@@ -25,6 +26,11 @@ interface NukeRequest {
 
 interface SyncRequest {
   table: string;
+}
+
+interface SyncState {
+  offset: Offset | undefined;
+  shapeHandle: string | undefined;
 }
 
 // Function to convert values based on their type
@@ -118,22 +124,26 @@ function handleMessage(msg: any, table: TableSchema) {
   const tableName = table.name;
   const columns = table.columns.filter(col => col !== table.primaryKey);
 
+  // Log the raw message received
+  console.log(`[${tableName}] Raw message received:`, JSON.stringify(msg, null, 2));
+
   try {
     // Validate input
     if (!value || typeof value !== 'object') {
-      console.error(`Invalid message value for table ${tableName}:`, value);
+      console.error(`[${tableName}] Invalid message value:`, value);
       throw new Error(`Invalid message value for table ${tableName}`);
     }
 
     // Clean and convert the values
     const cleanedValue = cleanFields(value, tableName);
+    console.log(`[${tableName}] Cleaned value:`, JSON.stringify(cleanedValue, null, 2));
     
     // Values to insert/update
     const pkValue = cleanedValue[table.primaryKey];
     
     // Handle missing primary key
     if (pkValue === undefined || pkValue === null) {
-      console.error(`Missing primary key for table ${tableName}:`, value);
+      console.error(`[${tableName}] Missing primary key:`, value);
       throw new Error(`Missing primary key for table ${tableName}`);
     }
     
@@ -143,61 +153,90 @@ function handleMessage(msg: any, table: TableSchema) {
       return val === undefined ? null : val;
     });
 
+    let operation: { sql: string; params: any[] } | null = null;
     switch (headers.operation) {
       case "insert":
-        return {
+        operation = {
           sql: `INSERT OR REPLACE INTO ${tableName} (${table.columns.join(", ")}) VALUES (${table.columns.map(() => "?").join(", ")})`,
           params: [pkValue, ...values],
         };
+        break;
       case "update":
-        return {
+        operation = {
           sql: `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(", ")} WHERE ${table.primaryKey} = ?`,
           params: [...values, pkValue],
         };
+        break;
       case "delete":
-        return {
+        operation = {
           sql: `DELETE FROM ${tableName} WHERE ${table.primaryKey} = ?`,
           params: [pkValue],
         };
+        break;
       default:
+        console.error(`[${tableName}] Unknown operation: ${headers.operation}`);
         throw new Error(`Unknown operation: ${headers.operation}`);
     }
+
+    if (operation) {
+      console.log(`[${tableName}] Generated SQL operation:`, JSON.stringify(operation, null, 2));
+    } else {
+       console.log(`[${tableName}] No SQL operation generated for message.`);
+    }
+    return operation;
+
   } catch (error) {
-    console.error(`Error handling message for table ${tableName}:`, error, "Value:", JSON.stringify(value));
-    throw error;
+    console.error(`[${tableName}] Error handling message:`, error, "Value:", JSON.stringify(value));
+    throw error; // Re-throw to be caught by the caller if necessary
   }
 }
 
 async function checkAndCreateTables(db: D1Database) {
   const start = Date.now();
+  console.log(`[DB Init] Starting database table check/creation...`);
   try {
     // Check each table with a simple SELECT
     for (const table of Object.keys(TABLE_SCHEMAS)) {
+      console.log(`[DB Init] Checking/Creating table: ${table}`);
       await ensureTableExists(db, table);
+      console.log(`[DB Init] Table ${table} ensured.`);
     }
-    console.log(`Tables checked/created in ${Date.now() - start}ms`);
+    console.log(`[DB Init] All tables checked/created in ${Date.now() - start}ms`);
   } catch (error) {
-    console.error(`Error initializing database:`, error);
+    console.error(`[DB Init] Error initializing database:`, error);
     throw error;
   }
 }
 
 async function ensureTableExists(db: D1Database, table: string) {
+  console.log(`[Ensure Table] Checking existence of table: ${table}`);
   try {
     // Try to select from the table
     await db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).first();
+    console.log(`[Ensure Table] Table ${table} exists.`);
   } catch (error) {
     // If table doesn't exist, create it
     if (error instanceof Error && error.message.includes('no such table')) {
+      console.log(`[Ensure Table] Table ${table} does not exist. Creating...`);
       const schema = TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS];
+      if (!schema) {
+        console.error(`[Ensure Table] Schema not found for table: ${table}`);
+        throw new Error(`Schema not found for table: ${table}`);
+      }
       // Format the SQL query to remove newlines and extra spaces
       const formattedSchema = schema.replace(/\s+/g, ' ').trim();
-      console.log(`Creating table ${table} with query "${formattedSchema}"`);
-      await db.exec(formattedSchema);
-      console.log(`Table ${table} created`);
+      console.log(`[Ensure Table] Creating table ${table} with query: "${formattedSchema}"`);
+      try {
+        await db.exec(formattedSchema);
+        console.log(`[Ensure Table] Table ${table} created successfully.`);
+      } catch (creationError) {
+        console.error(`[Ensure Table] Error executing CREATE TABLE for ${table}:`, creationError);
+        throw creationError; // Re-throw creation error
+      }
     } else {
-      console.error(`Error checking/creating table ${table}:`, error);
-      throw error;
+      // Log other types of errors encountered during the check
+      console.error(`[Ensure Table] Error checking table ${table}:`, error);
+      throw error; // Re-throw unexpected error
     }
   }
 }
@@ -205,411 +244,614 @@ async function ensureTableExists(db: D1Database, table: string) {
 async function syncTable(db: D1Database, table: TableSchema, env: Env) {
   const start = Date.now();
   const tableName = table.name;
+  console.log(`[Sync ${tableName}] Starting sync process.`);
   
   // Try to acquire lock for this table
+  console.log(`[Sync ${tableName}] Attempting to acquire lock.`);
   const hasLock = await acquireLock(db, tableName);
   if (!hasLock) {
-    console.log(`Another sync is already running for table ${tableName}, skipping`);
+    console.log(`[Sync ${tableName}] Could not acquire lock (already held or error). Skipping sync.`);
     return;
   }
+  console.log(`[Sync ${tableName}] Lock acquired.`);
   
   try {
-    const lastKnownOffset = await getLastOffset(db, tableName);
+    // Get last known offset AND shape handle
+    const { offset: lastKnownOffset, shapeHandle: lastKnownShapeHandle } = await getLastSyncState(db, tableName);
+    console.log(`[Sync ${tableName}] Last known state: offset=${lastKnownOffset}, handle=${lastKnownShapeHandle}`);
     
-    console.log(`Starting sync for table ${tableName} from offset ${lastKnownOffset || 'beginning'}`);
+    console.log(`[Sync ${tableName}] Creating ShapeStream to ${env.ELECTRIC_URL} for table ${tableName}`);
     
-    const stream = new ShapeStream({
-      url: env.ELECTRIC_URL,
-      params: {
+    // Prepare params, including shapeHandle if not an initial sync
+    const streamParams: Record<string, any> = {
         table: tableName,
         replica: "full",
         columns: table.columns,
         source_id: env.ELECTRIC_SOURCE_ID,
         source_secret: env.ELECTRIC_SOURCE_SECRET,
-      },
-      subscribe: false,
-      offset: lastKnownOffset,
+    };
+    if (lastKnownOffset) {
+        streamParams.offset = lastKnownOffset;
+        // Add shapeHandle only if we have one from previous sync
+        if (lastKnownShapeHandle) {
+            streamParams.shapeHandle = lastKnownShapeHandle;
+            console.log(`[Sync ${tableName}] Using existing shape handle: ${lastKnownShapeHandle}`);
+        } else {
+             console.warn(`[Sync ${tableName}] Performing incremental sync (offset=${lastKnownOffset}) but no shape handle found. This might cause issues.`);
+             // Proceed without handle - Electric might handle this or error out
+        }
+    } else {
+        console.log(`[Sync ${tableName}] Performing initial sync (no offset).`);
+        // No offset, no shapeHandle needed for initial fetch
+    }
+
+    const stream = new ShapeStream({
+      url: env.ELECTRIC_URL,
+      params: streamParams,
+      subscribe: false, // We want a snapshot, not continuous sync
     });
 
     let currentBatch: any[] = [];
     let finalOffset: Offset | undefined;
+    let messageCount = 0;
+    let changeMessageCount = 0;
 
+    console.log(`[Sync ${tableName}] Subscribing to stream...`);
     await new Promise<void>((resolve, reject) => {
       stream.subscribe(
         async (messages) => {
-          console.log(`Received ${messages.length} messages for table ${tableName}`);
+          messageCount += messages.length;
+          console.log(`[Sync ${tableName}] Received ${messages.length} messages (total: ${messageCount}).`);
           for (const msg of messages) {
             if (isChangeMessage(msg)) {
+              changeMessageCount++;
               try {
-                console.log(`Processing message for ${tableName}:`, {
-                  operation: msg.headers.operation,
-                  value: msg.value
-                });
+                // console.log(`[Sync ${tableName}] Processing change message:`, JSON.stringify(msg, null, 2)); // Already logged in handleMessage
                 const sqlOperation = handleMessage(msg, table);
                 if (sqlOperation) {
                   currentBatch.push(sqlOperation);
+                  // console.log(`[Sync ${tableName}] Added operation to batch. Batch size: ${currentBatch.length}`);
+                } else {
+                  console.warn(`[Sync ${tableName}] handleMessage returned null for a change message.`);
                 }
               } catch (error) {
-                console.error(`Error handling message for ${tableName}:`, error);
+                // Error is logged within handleMessage
+                console.error(`[Sync ${tableName}] Skipping message due to error in handleMessage.`, error);
                 // Continue processing other messages
               }
-            }
-            else if (isControlMessage(msg) && msg.headers.control === "up-to-date") {
+            } else if (isControlMessage(msg) && msg.headers.control === "up-to-date") {
               finalOffset = stream.lastOffset;
-              resolve();
+              console.log(`[Sync ${tableName}] Received 'up-to-date' control message. Final offset: ${finalOffset}`);
+              resolve(); // Stop processing messages for this stream
+            } else {
+              console.log(`[Sync ${tableName}] Received other message type:`, JSON.stringify(msg, null, 2));
             }
           }
-          console.log(`Processed ${messages.length} messages for table ${tableName}`);
+          console.log(`[Sync ${tableName}] Finished processing batch of ${messages.length} messages. Change messages processed: ${changeMessageCount}. Batch size: ${currentBatch.length}.`);
         },
         (error: Error) => {
-          reject(error);
+          console.error(`[Sync ${tableName}] Stream subscription error:`, error);
+          reject(error); // Reject the promise on stream error
         }
       );
-    });
+
+    }); // End of Promise
       
+    console.log(`[Sync ${tableName}] Stream processing complete. Total messages received: ${messageCount}. Change messages processed: ${changeMessageCount}. Operations in batch: ${currentBatch.length}.`);
+    
     // Apply changes and save offset only if we have changes
     if (currentBatch.length > 0) {
-      console.log(`Applying ${currentBatch.length} changes to table ${tableName}`);
+      console.log(`[Sync ${tableName}] Applying ${currentBatch.length} changes.`);
       try {
         // Log first few SQL statements for debugging
-        const sampleSize = Math.min(currentBatch.length, 3);
-        console.log(`Sample SQL statements (${sampleSize}/${currentBatch.length}):`, 
-          currentBatch.slice(0, sampleSize).map(op => ({
-            sql: op.sql,
-            params: op.params
-          })));
+        const sampleSize = Math.min(currentBatch.length, 5); // Increased sample size
+        console.log(`[Sync ${tableName}] Sample SQL statements (${sampleSize}/${currentBatch.length}):`,
+          JSON.stringify(currentBatch.slice(0, sampleSize), null, 2)); // Use JSON.stringify for better readability
+
+        console.log(`[Sync ${tableName}] Executing batch...`);
+        const batchResult = await db.batch(currentBatch);
+        console.log(`[Sync ${tableName}] Batch execution result:`, JSON.stringify(batchResult, null, 2));
         
-        await db.batch(currentBatch);
-        
-        // Verify changes were applied
-        const count = await db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
-        console.log(`Current row count in ${tableName}:`, count?.count);
+        // Verify changes were applied by checking count again
+        const countResult = await db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
+        const newCount = countResult?.count ?? 'N/A';
+        console.log(`[Sync ${tableName}] Row count after batch: ${newCount}`);
         
         if (finalOffset) {
-          await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset) VALUES (?, ?)")
-            .bind(tableName, finalOffset)
+          // Attempt to get the shape handle from the stream instance
+          // IMPORTANT: This assumes the property exists; adjust if needed based on library specifics
+          const currentShapeHandle = (stream as any).shapeHandle ?? lastKnownShapeHandle;
+          
+          if (!currentShapeHandle) {
+              console.warn(`[Sync ${tableName}] Could not determine shape handle after sync. State might be incomplete.`);
+          }
+          
+          console.log(`[Sync ${tableName}] Saving final state: offset=${finalOffset}, handle=${currentShapeHandle}`);
+          await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
+            .bind(tableName, finalOffset, currentShapeHandle)
             .run();
+          console.log(`[Sync ${tableName}] Final sync state saved.`);
+        } else {
+          console.warn(`[Sync ${tableName}] No final offset received, cannot update sync_state.`);
         }
-        console.log(`Table ${tableName} synced in ${Date.now() - start}ms`);
+        console.log(`[Sync ${tableName}] Sync completed successfully in ${Date.now() - start}ms.`);
       } catch (error) {
-        console.error(`Error executing batch for ${tableName}:`, error);
+        console.error(`[Sync ${tableName}] Error executing batch:`, error);
         // Log a sample of the batch that caused the error
-        const sampleSize = Math.min(currentBatch.length, 3);
-        console.error(`Sample of ${sampleSize}/${currentBatch.length} batch items that caused the error:`, 
+        const sampleSize = Math.min(currentBatch.length, 5);
+        console.error(`[Sync ${tableName}] Sample of ${sampleSize}/${currentBatch.length} batch items that potentially caused the error:`, 
           JSON.stringify(currentBatch.slice(0, sampleSize), null, 2));
-        throw error;
+        // Do not re-throw here, let the finally block handle lock release
       }
     } else {
-      console.log(`No changes for table ${tableName}`);
+      console.log(`[Sync ${tableName}] No changes to apply.`);
+       // Even if no changes, update offset if we received one
+       if (finalOffset) {
+          // Attempt to get the shape handle from the stream instance
+          const currentShapeHandle = (stream as any).shapeHandle ?? lastKnownShapeHandle;
+
+         if (!currentShapeHandle) {
+             console.warn(`[Sync ${tableName}] Could not determine shape handle after sync (no changes). State might be incomplete.`);
+         }
+
+          console.log(`[Sync ${tableName}] Saving final state even though no changes applied: offset=${finalOffset}, handle=${currentShapeHandle}`);
+          await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
+            .bind(tableName, finalOffset, currentShapeHandle)
+            .run();
+          console.log(`[Sync ${tableName}] Final sync state saved.`);
+       }
     }
   } catch (error) {
-    console.error(`Error syncing table ${tableName}:`, error);
-    throw error;
+    // Catch errors from stream setup or promise handling
+    console.error(`[Sync ${tableName}] Critical error during sync process:`, error);
+    // Do not re-throw, allow finally to release lock
   } finally {
     // Always release the lock
+    console.log(`[Sync ${tableName}] Releasing lock.`);
     try {
       await releaseLock(db, tableName);
-      console.log(`Released lock for ${tableName}`);
+      console.log(`[Sync ${tableName}] Lock released.`);
     } catch (error) {
-      console.error(`Error releasing lock for ${tableName}:`, error);
+      console.error(`[Sync ${tableName}] Error releasing lock:`, error);
     }
+    console.log(`[Sync ${tableName}] Sync process finished (including finally block) in ${Date.now() - start}ms.`);
   }
-}
-
-async function syncDatabase(db: D1Database, env: Env) {
-  const start = Date.now();
-  console.log(`Starting database sync`);
-  
-  for (const table of TABLES) {
-    // Try to acquire lock for this table
-    const hasLock = await acquireLock(db, table.name);
-    if (!hasLock) {
-      console.log(`Another sync is already running for table ${table.name}, skipping`);
-      continue;
-    }
-
-    try {
-      await syncTable(db, table, env);
-    } catch (error) {
-      console.error(`Error syncing table ${table.name}:`, error);
-    } finally {
-      // Always release the lock
-      await releaseLock(db, table.name);
-    }
-  }
-  
-  console.log(`Database sync completed in ${Date.now() - start}ms`);
 }
 
 async function acquireLock(db: D1Database, tableName: string): Promise<boolean> {
   const now = Math.floor(Date.now() / 1000); // Unix timestamp
+  const lockId = crypto.randomUUID(); // Unique ID for this attempt
+  console.log(`[Lock ${tableName}] Attempting acquire with lockId: ${lockId}, time: ${now}`);
   try {
     // Try to insert a lock record
     await db.prepare(`
-      INSERT INTO sync_lock (table_name, locked_at)
-      VALUES (?, ?)
-    `).bind(tableName, now).run();
+      INSERT INTO sync_lock (table_name, locked_at, lock_id)
+      VALUES (?, ?, ?)
+    `).bind(tableName, now, lockId).run();
+    console.log(`[Lock ${tableName}] Lock acquired successfully with lockId: ${lockId}`);
     return true;
-  } catch (error) {
-    // If insert fails, check if lock is stale (older than 5 minutes)
-    const lock = await db.prepare(`
-      SELECT locked_at FROM sync_lock WHERE table_name = ?
-    `).bind(tableName).first() as { locked_at: number } | undefined;
-    
-    if (lock) {
-      const fiveMinutesAgo = Math.floor((Date.now() - 5 * 60 * 1000) / 1000);
-      
-      if (lock.locked_at < fiveMinutesAgo) {
-        // Lock is stale, try to update it
-        try {
-          await db.prepare(`
-            UPDATE sync_lock 
-            SET locked_at = ? 
-            WHERE table_name = ?
-          `).bind(now, tableName).run();
-          return true;
-        } catch (error) {
-          console.error(`Error updating stale lock for ${tableName}:`, error);
-          return false;
-        }
-      }
+  } catch (error: any) {
+    // Check if it's a UNIQUE constraint failure (expected if lock exists)
+    if (error.message?.includes('UNIQUE constraint failed')) {
+       console.log(`[Lock ${tableName}] Lock already exists. Checking if stale.`);
+       // If insert fails due to unique constraint, check if lock is stale (older than 5 minutes)
+       const lock = await db.prepare(`
+         SELECT locked_at, lock_id FROM sync_lock WHERE table_name = ?
+       `).bind(tableName).first() as { locked_at: number, lock_id: string } | undefined;
+       
+       if (lock) {
+         const fiveMinutesAgo = now - (5 * 60);
+         console.log(`[Lock ${tableName}] Found existing lock: ID=${lock.lock_id}, LockedAt=${lock.locked_at}, FiveMinAgo=${fiveMinutesAgo}`);
+         
+         if (lock.locked_at < fiveMinutesAgo) {
+           console.log(`[Lock ${tableName}] Existing lock is stale (older than 5 minutes). Attempting to steal lock.`);
+           // Lock is stale, try to update it (atomic compare-and-swap)
+           try {
+             const updateResult = await db.prepare(`
+               UPDATE sync_lock 
+               SET locked_at = ?, lock_id = ? 
+               WHERE table_name = ? AND lock_id = ? 
+             `).bind(now, lockId, tableName, lock.lock_id).run(); // Use previous lock_id to ensure atomicity
+
+             if (updateResult.meta.changes > 0) {
+                console.log(`[Lock ${tableName}] Stale lock updated successfully with new lockId: ${lockId}`);
+                return true; // Successfully stole the lock
+             } else {
+                console.log(`[Lock ${tableName}] Failed to update stale lock (likely updated by another process between check and update).`);
+                return false; // Another process updated it first
+             }
+
+           } catch (updateError) {
+             console.error(`[Lock ${tableName}] Error updating stale lock:`, updateError);
+             return false; // Error during update
+           }
+         } else {
+            console.log(`[Lock ${tableName}] Existing lock is not stale. Cannot acquire.`);
+            return false; // Lock exists and is not stale
+         }
+       } else {
+          console.warn(`[Lock ${tableName}] Insert failed but could not find existing lock record. Race condition?`);
+          return false; // Should not happen, but handle defensively
+       }
+    } else {
+       // Log unexpected errors during insert
+       console.error(`[Lock ${tableName}] Unexpected error acquiring lock:`, error);
+       return false;
     }
-    return false;
   }
 }
 
 async function releaseLock(db: D1Database, tableName: string): Promise<void> {
-  await db.prepare(`DELETE FROM sync_lock WHERE table_name = ?`).bind(tableName).run();
-}
-
-async function handleSync(env: Env) {
-  const start = Date.now();
-  console.log('Starting sync');
-  
+  console.log(`[Lock ${tableName}] Attempting to release lock.`);
   try {
-    // Initialize database
-    await checkAndCreateTables(env.DB);
-    
-    // Sync all tables
-    for (const table of TABLES) {
-      // Try to acquire lock for this table
-      const hasLock = await acquireLock(env.DB, table.name);
-      if (!hasLock) {
-        console.log(`Another sync is already running for table ${table.name}, skipping`);
-        continue;
-      }
-
-      try {
-        await syncTable(env.DB, table, env);
-      } catch (error) {
-        console.error(`Error syncing table ${table.name}:`, error);
-      } finally {
-        // Always release the lock
-        await releaseLock(env.DB, table.name);
-      }
+    // We don't strictly need lock_id for release, but deleting ensures it's gone
+    const result = await db.prepare(`DELETE FROM sync_lock WHERE table_name = ?`).bind(tableName).run();
+    if (result.meta.changes > 0) {
+        console.log(`[Lock ${tableName}] Lock released successfully.`);
+    } else {
+        console.warn(`[Lock ${tableName}] Attempted to release lock, but no lock found for table.`);
     }
-    
-    console.log(`Sync completed in ${Date.now() - start}ms`);
   } catch (error) {
-    console.error('Error during sync:', error);
-    throw error;
+     console.error(`[Lock ${tableName}] Error releasing lock:`, error);
+     // Consider if this error should be propagated
   }
 }
 
-async function getLastOffset(db: D1Database, tableName: string): Promise<Offset | undefined> {
-  const result = await db.prepare("SELECT last_offset FROM sync_state WHERE table_name = ?").bind(tableName).first();
-  return result?.last_offset as Offset | undefined;
+async function getLastSyncState(db: D1Database, tableName: string): Promise<SyncState> {
+  console.log(`[Sync State ${tableName}] Fetching last sync state (offset and handle).`);
+  try {
+    const result = await db.prepare("SELECT last_offset, shape_handle FROM sync_state WHERE table_name = ?")
+                         .bind(tableName)
+                         .first<{ last_offset: Offset | undefined, shape_handle: string | null }>();
+                         
+    const offset = result?.last_offset;
+    const shapeHandle = result?.shape_handle ?? undefined; // Convert null to undefined
+    
+    console.log(`[Sync State ${tableName}] Found state: offset=${offset}, handle=${shapeHandle}`);
+    return { offset, shapeHandle };
+    
+  } catch (error) {
+     console.error(`[Sync State ${tableName}] Error fetching last sync state:`, error);
+     // Return default state if fetch fails
+     return { offset: undefined, shapeHandle: undefined };
+  }
 }
 
 async function handleNuke(request: Request, env: Env) {
+  console.log(`[Nuke] Received nuke request to ${request.url}`);
   if (request.method !== "POST") {
+    console.log(`[Nuke] Invalid method: ${request.method}`);
     return new Response("Method not allowed", { status: 405 });
   }
 
   const signature = request.headers.get("x-webhook-signature");
+  // Avoid logging the actual signature unless necessary for debugging
   if (!signature || signature !== env.WEBHOOK_SECRET) {
+    console.log(`[Nuke] Unauthorized access attempt.`);
     return new Response("Unauthorized", { status: 401 });
   }
+  console.log(`[Nuke] Signature validated.`);
 
-  const body = await request.json() as NukeRequest;
+  let body: NukeRequest;
+  try {
+    body = await request.json() as NukeRequest;
+    console.log(`[Nuke] Parsed request body:`, JSON.stringify(body));
+  } catch (e) {
+     console.error(`[Nuke] Error parsing request body:`, e);
+     return new Response("Invalid request body", { status: 400 });
+  }
+
 
   try {
-    // Initialize database to ensure the sync tables exist
+    console.log(`[Nuke] Initializing database for nuke operation...`);
+    // Initialize database to ensure the sync tables exist (needed for table-specific nuke locks)
     await checkAndCreateTables(env.DB);
+    console.log(`[Nuke] Database initialized.`);
     
-    // For 'all' nuke type, no need to acquire locks as we'll delete everything
+    let tableName: string | undefined = undefined;
     if (body.type === 'table') {
-      // Only acquire locks when nuking specific tables
-      const tableName = body.table;
+      tableName = body.table;
       if (!tableName || !TABLES.some(t => t.name === tableName)) {
+        console.log(`[Nuke] Invalid table specified: ${tableName}`);
         return new Response(`Invalid table: ${tableName}`, { status: 400 });
       }
       
-      // Try to acquire lock for the specific table
+      console.log(`[Nuke Table ${tableName}] Attempting lock acquisition.`);
       const hasLock = await acquireLock(env.DB, tableName);
       if (!hasLock) {
+        console.log(`[Nuke Table ${tableName}] Could not acquire lock.`);
         return new Response(`Cannot acquire lock for table ${tableName}`, { status: 409 });
       }
+       console.log(`[Nuke Table ${tableName}] Lock acquired.`);
     }
 
     // Now proceed with nuking
     switch (body.type) {
       case 'all':
+        console.log(`[Nuke All] Starting database nuke.`);
         await nukeDatabase(env.DB);
+        console.log(`[Nuke All] Database nuke complete.`);
         return new Response("Database nuked", { status: 200 });
       
       case 'table':
-        const tableName = body.table!;
-        await nukeTable(env.DB, tableName);
+        // tableName is already validated and locked
+        console.log(`[Nuke Table ${tableName}] Starting table nuke.`);
+        await nukeTable(env.DB, tableName!);
+        console.log(`[Nuke Table ${tableName}] Table nuke complete.`);
         // Release the lock for this table
-        await releaseLock(env.DB, tableName);
+        console.log(`[Nuke Table ${tableName}] Releasing lock.`);
+        await releaseLock(env.DB, tableName!);
+        console.log(`[Nuke Table ${tableName}] Lock released.`);
         return new Response(`Table ${tableName} nuked`, { status: 200 });
       
       default:
+        // This case should ideally not be reached if using TypeScript types properly
+        console.error(`[Nuke] Invalid nuke type received: ${body.type}`);
+        // Release lock if it was acquired for an invalid type somehow
+        if (tableName) await releaseLock(env.DB, tableName);
         return new Response(`Invalid nuke type: ${body.type}`, { status: 400 });
     }
   } catch (error) {
-    console.error("Error during nuke operation:", error);
-    return new Response(error instanceof Error ? error.message : "Internal server error", { status: 500 });
+    console.error("[Nuke] Error during nuke operation:", error);
+    // Attempt to release lock if held during an error in the main try block
+    if (body.type === 'table' && body.table) {
+        try {
+            console.log(`[Nuke Table ${body.table}] Attempting lock release after error.`);
+            await releaseLock(env.DB, body.table);
+        } catch (releaseError) {
+            console.error(`[Nuke Table ${body.table}] Error releasing lock after nuke error:`, releaseError);
+        }
+    }
+    return new Response(error instanceof Error ? error.message : "Internal server error during nuke", { status: 500 });
   }
 }
 
 async function nukeDatabase(db: D1Database) {
-  console.log(`Nuking database`);
+  console.log(`[Nuke DB] Nuking database`);
+  const start = Date.now();
   
   // First clear the sync tables
+  console.log(`[Nuke DB] Deleting from sync_state`);
   await db.prepare("DELETE FROM sync_state").run();
+  console.log(`[Nuke DB] Deleting from sync_lock`);
   await db.prepare("DELETE FROM sync_lock").run();
   
   // Then nuke all actual data tables
-  for (const table of TABLES) {
-    await nukeTable(db, table.name, false); // Don't touch sync_state during table nuke
+  const tableNames = TABLES.map(t => t.name);
+  console.log(`[Nuke DB] Nuking tables: ${tableNames.join(', ')}`);
+  for (const tableName of tableNames) {
+    await nukeTable(db, tableName, false); // Don't touch sync_state during individual table nuke here
   }
   
-  console.log(`Database nuked`);
+  console.log(`[Nuke DB] Database nuke completed in ${Date.now() - start}ms`);
 }
 
 async function nukeTable(db: D1Database, tableName: string, updateSyncState = true) {
-  console.log(`Nuking table ${tableName}`);
+  const start = Date.now();
+  console.log(`[Nuke Table ${tableName}] Starting nuke process (updateSyncState=${updateSyncState})`);
   
-  // Drop the table and recreate it
-  await db.prepare(`DROP TABLE IF EXISTS ${tableName}`).run();
-  await db.exec(TABLE_SCHEMAS[tableName as keyof typeof TABLE_SCHEMAS]);
+  // Drop the table
+  console.log(`[Nuke Table ${tableName}] Dropping table...`);
+  try {
+    await db.prepare(`DROP TABLE IF EXISTS ${tableName}`).run();
+    console.log(`[Nuke Table ${tableName}] Table dropped.`);
+  } catch (dropError) {
+     console.error(`[Nuke Table ${tableName}] Error dropping table:`, dropError);
+     // Continue to recreate if drop failed (might not exist)
+  }
+  
+  // Recreate the table
+  const schema = TABLE_SCHEMAS[tableName as keyof typeof TABLE_SCHEMAS];
+  if (!schema) {
+     console.error(`[Nuke Table ${tableName}] Schema not found! Cannot recreate table.`);
+     throw new Error(`Schema not found for table: ${tableName}`);
+  }
+  console.log(`[Nuke Table ${tableName}] Recreating table...`);
+  try {
+    await db.exec(schema);
+    console.log(`[Nuke Table ${tableName}] Table recreated.`);
+  } catch (createError) {
+     console.error(`[Nuke Table ${tableName}] Error recreating table:`, createError);
+     throw createError; // Propagate if recreation fails
+  }
   
   // Only update sync_state if this is a single table nuke (not part of a database nuke)
   if (updateSyncState) {
+    console.log(`[Nuke Table ${tableName}] Deleting sync state for this table.`);
     await db.prepare("DELETE FROM sync_state WHERE table_name = ?").bind(tableName).run();
+    console.log(`[Nuke Table ${tableName}] Sync state deleted.`);
   }
   
-  console.log(`Table ${tableName} nuked`);
+  console.log(`[Nuke Table ${tableName}] Nuke process completed in ${Date.now() - start}ms`);
 }
 
 // This function checks and creates a specific table and sync tables
 async function checkAndCreateSpecificTable(db: D1Database, tableName: string) {
   const start = Date.now();
+  console.log(`[Check Specific ${tableName}] Ensuring sync tables and table ${tableName} exist.`);
+  // Define sync tables explicitly for clarity
   const tablesToCheck = ['sync_state', 'sync_lock', tableName];
   
   try {
     // Check and create sync_state and sync_lock tables, plus the specific table
     for (const table of tablesToCheck) {
+      console.log(`[Check Specific ${tableName}] Ensuring ${table} exists...`);
       await ensureTableExists(db, table);
+       console.log(`[Check Specific ${tableName}] Ensured ${table} exists.`);
     }
-    console.log(`Table ${tableName} and sync tables checked/created in ${Date.now() - start}ms`);
+    console.log(`[Check Specific ${tableName}] Table ${tableName} and sync tables checked/created in ${Date.now() - start}ms`);
   } catch (error) {
-    console.error(`Error initializing table ${tableName}:`, error);
+    console.error(`[Check Specific ${tableName}] Error initializing table ${tableName} or sync tables:`, error);
     throw error;
   }
 }
 
 async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionContext) {
+  console.log(`[Sync Request] Received sync request to ${request.url}`);
   // Validate request method
   if (request.method !== "POST") {
+    console.log(`[Sync Request] Invalid method: ${request.method}`);
     return new Response("Method not allowed", { status: 405 });
   }
   
   // Validate signature
   const signature = request.headers.get("x-webhook-signature");
   if (!signature || signature !== env.WEBHOOK_SECRET) {
+    console.log(`[Sync Request] Unauthorized access attempt.`);
     return new Response("Unauthorized", { status: 401 });
   }
+  console.log(`[Sync Request] Signature validated.`);
   
+  let body: SyncRequest;
   try {
-    // Parse request body
-    const body = await request.json() as SyncRequest;
+    body = await request.json() as SyncRequest;
+    console.log(`[Sync Request] Parsed request body:`, JSON.stringify(body));
+  } catch (e) {
+    console.error(`[Sync Request] Error parsing request body:`, e);
+    return new Response("Invalid request body", { status: 400 });
+  }
+
+  try {
     const { table: tableName } = body;
     
     // Validate table
     const table = TABLES.find(t => t.name === tableName);
     if (!table) {
+      console.log(`[Sync Request] Invalid table specified: ${tableName}`);
       return new Response(`Invalid table: ${tableName}`, { status: 400 });
     }
+    console.log(`[Sync Request] Valid table specified: ${tableName}`);
     
-    // Ensure the specific table and sync tables exist
-    await checkAndCreateSpecificTable(env.DB, tableName);
+    // Removed checkAndCreateSpecificTable - assuming scheduled handler ensures tables exist first.
+    console.log(`[Sync Request] Scheduling background sync (table existence checked by scheduled handler).`);
     
-    // Run the sync in the background
+    // Run the sync in the background using waitUntil
+    console.log(`[Sync Request] Scheduling background sync for ${tableName}.`);
     ctx.waitUntil(
-      syncTable(env.DB, table, env)
-        .catch(error => {
-          console.error(`Error syncing ${tableName}: ${error}`);
-        })
+      (async () => {
+        console.log(`[Background Sync ${tableName}] Starting background execution.`);
+        try {
+          await syncTable(env.DB, table, env);
+          console.log(`[Background Sync ${tableName}] Background execution finished successfully.`);
+        } catch (error) {
+          // Log error from the background task
+          console.error(`[Background Sync ${tableName}] Error during background execution: ${error}`);
+          // Decide if further action is needed (e.g., retry, notification)
+        }
+      })()
     );
     
     // Return success immediately while the sync continues in the background
-    return new Response(`Sync started for ${tableName}`, { status: 202 });
+    console.log(`[Sync Request] Responding 202 Accepted for ${tableName}.`);
+    return new Response(`Sync scheduled for ${tableName}`, { status: 202 });
   } catch (error) {
-    console.error("Error handling sync request:", error);
-    return new Response(error instanceof Error ? error.message : "Internal server error", { status: 500 });
+    // Catch errors from validation, table checking, or scheduling
+    console.error("[Sync Request] Error handling sync request:", error);
+    return new Response(error instanceof Error ? error.message : "Internal server error during sync request", { status: 500 });
   }
 }
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname;
+    console.log(`[Fetch] Received request: ${request.method} ${path}`);
     
-    if (url.pathname === "/nuke") {
-      return handleNuke(request, env);
+    // Log essential env vars (avoid secrets)
+    console.log(`[Fetch] Env ELECTRIC_URL: ${env.ELECTRIC_URL ? 'Set' : 'Not Set'}`);
+    console.log(`[Fetch] Env ELECTRIC_SOURCE_ID: ${env.ELECTRIC_SOURCE_ID ? 'Set' : 'Not Set'}`);
+    
+    try {
+        if (path === "/nuke") {
+          return await handleNuke(request, env);
+        }
+        
+        if (path === "/sync") {
+          return await handleSyncRequest(request, env, ctx);
+        }
+
+        if (path === "/health") {
+          console.log(`[Fetch] Responding to /health check`);
+          return new Response("OK", { status: 200 });
+        }
+        
+        console.log(`[Fetch] Path not found: ${path}`);
+        return new Response("Not found", { status: 404 });
+
+    } catch (error) {
+       console.error(`[Fetch] Unhandled error in fetch handler for path ${path}:`, error);
+       return new Response("Internal Server Error", { status: 500 });
     }
-    
-    if (url.pathname === "/sync") {
-      return handleSyncRequest(request, env, ctx);
-    }
-    
-    return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const startTime = Date.now();
+    console.log(`[Scheduled] Cron triggered at: ${new Date(event.scheduledTime).toISOString()}`);
+    
+    // Log essential env vars (avoid secrets)
+    console.log(`[Scheduled] Env ELECTRIC_URL: ${env.ELECTRIC_URL ? 'Set' : 'Not Set'}`);
+    console.log(`[Scheduled] Env ELECTRIC_SOURCE_ID: ${env.ELECTRIC_SOURCE_ID ? 'Set' : 'Not Set'}`);
+    console.log(`[Scheduled] Env WEBHOOK_SECRET: ${env.WEBHOOK_SECRET ? 'Set' : 'Not Set'}`);
+
+
     try {
-      // Initialize database first
+      // Initialize database first - ensures sync tables exist before triggering syncs
+      console.log(`[Scheduled] Initializing database tables...`);
       await checkAndCreateTables(env.DB);
+      console.log(`[Scheduled] Database tables initialized.`);
       
-      // Trigger individual sync requests for each table
+      // Trigger individual sync requests for each table via fetch to self
       const promises = [];
       
-      // Get the worker URL from the cron event
-      const workerUrl = new URL("https://sync.capgo.app");
+      // Determine the worker URL dynamically - THIS IS CRUCIAL
+      // Assuming the worker is accessible via a default route or custom domain.
+      // Option 1: Hardcode (less flexible, needs update if URL changes)
+      // const workerUrl = new URL("https://your-worker-name.your-account.workers.dev/");
+      // Option 2: Construct from request headers (NOT AVAILABLE IN SCHEDULED)
+      // Option 3: Use an environment variable (Recommended)
+      const workerBaseUrl = env.WORKER_BASE_URL || "https://sync.capgo.app"; // Default, but override with env var
+      if (!workerBaseUrl) {
+          console.error("[Scheduled] WORKER_BASE_URL environment variable is not set. Cannot trigger sync requests.");
+          return; // Stop if we don't know where to send requests
+      }
+       console.log(`[Scheduled] Using worker base URL: ${workerBaseUrl}`);
+
       
       for (const table of TABLES) {
-        const syncUrl = new URL("/sync", workerUrl);
+        const syncUrl = new URL("/sync", workerBaseUrl); // Use WORKER_BASE_URL
+        console.log(`[Scheduled] Triggering sync POST request to: ${syncUrl.toString()} for table ${table.name}`);
         promises.push(
           fetch(syncUrl.toString(), {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "x-webhook-signature": env.WEBHOOK_SECRET
+              "x-webhook-signature": env.WEBHOOK_SECRET // Use the secret to authenticate the self-request
             },
             body: JSON.stringify({
               table: table.name
             })
+          }).then(async response => {
+             // Log the response from the /sync endpoint
+             const status = response.status;
+             const text = await response.text();
+             console.log(`[Scheduled] Response from triggering ${table.name}: Status ${status}, Body: ${text}`);
+             if (!response.ok) {
+                console.error(`[Scheduled] Failed to trigger sync for ${table.name}. Status: ${status}, Body: ${text}`);
+             }
+          }).catch(error => {
+             console.error(`[Scheduled] Error triggering sync fetch for ${table.name}:`, error);
           })
         );
       }
       
-      // Wait for all triggers to be sent (not for them to complete)
+      // Wait for all trigger fetch requests to be initiated (doesn't wait for syncs to complete)
+      console.log(`[Scheduled] Waiting for all ${promises.length} sync triggers to be sent...`);
       await Promise.all(promises);
-      console.log(`Triggered sync for all tables`);
+      console.log(`[Scheduled] All sync triggers sent. Cron execution finished in ${Date.now() - startTime}ms.`);
     } catch (error) {
-      console.error("Error during scheduled sync:", error);
+      // Catch errors from checkAndCreateTables or fetch triggering logic
+      console.error("[Scheduled] Error during scheduled execution:", error);
+      // Consider adding monitoring/alerting here
     }
   }
 };
