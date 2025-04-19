@@ -263,33 +263,47 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
     console.log(`[Sync ${tableName}] Creating ShapeStream to ${env.ELECTRIC_URL} for table ${tableName}`);
     
     // Prepare params, including shapeHandle if not an initial sync
-    const streamParams: Record<string, any> = {
+    const customParams: Record<string, any> = {
         table: tableName,
         replica: "full",
         columns: table.columns,
         source_id: env.ELECTRIC_SOURCE_ID,
         source_secret: env.ELECTRIC_SOURCE_SECRET,
     };
+
+    // Prepare constructor options, including offset and shapeHandle if applicable
+    const streamOptions: Record<string, any> = {
+        url: env.ELECTRIC_URL,
+        params: customParams, // Pass only custom params here
+        subscribe: false, // We want a snapshot, not continuous sync
+    };
+
     if (lastKnownOffset) {
-        streamParams.offset = lastKnownOffset;
-        // Add shapeHandle only if we have one from previous sync
+        streamOptions.offset = lastKnownOffset;
+        console.log(`[Sync ${tableName}] Setting stream offset: ${lastKnownOffset}`);
+
         if (lastKnownShapeHandle) {
-            streamParams.shapeHandle = lastKnownShapeHandle;
-            console.log(`[Sync ${tableName}] Using existing shape handle: ${lastKnownShapeHandle}`);
+             streamOptions.shapeHandle = lastKnownShapeHandle; // Assuming shapeHandle is also a top-level option
+             console.log(`[Sync ${tableName}] Setting stream shape handle: ${lastKnownShapeHandle}`);
         } else {
-             console.warn(`[Sync ${tableName}] Performing incremental sync (offset=${lastKnownOffset}) but no shape handle found. This might cause issues.`);
-             // Proceed without handle - Electric might handle this or error out
+             console.warn(`[Sync ${tableName}] Performing incremental sync (offset=${lastKnownOffset}) but no shape handle found.`);
+             // Electric client should handle this if shapeHandle is required
         }
     } else {
-        console.log(`[Sync ${tableName}] Performing initial sync (no offset).`);
-        // No offset, no shapeHandle needed for initial fetch
+         console.log(`[Sync ${tableName}] Performing initial sync (no offset/handle).`);
     }
 
-    const stream = new ShapeStream({
+    // Ensure options match the expected ShapeStreamOptions type
+    const typedStreamOptions: import("@electric-sql/client").ShapeStreamOptions = {
       url: env.ELECTRIC_URL,
-      params: streamParams,
-      subscribe: false, // We want a snapshot, not continuous sync
-    });
+      params: customParams,
+      subscribe: false,
+      ...(streamOptions.offset && { offset: streamOptions.offset }),
+      ...(streamOptions.shapeHandle && { shapeHandle: streamOptions.shapeHandle }),
+    };
+
+    console.log(`[Sync ${tableName}] Final ShapeStream options:`, JSON.stringify(typedStreamOptions, null, 2));
+    const stream = new ShapeStream(typedStreamOptions);
 
     let currentBatch: any[] = [];
     let finalOffset: Offset | undefined;
@@ -322,6 +336,8 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
             } else if (isControlMessage(msg) && msg.headers.control === "up-to-date") {
               finalOffset = stream.lastOffset;
               console.log(`[Sync ${tableName}] Received 'up-to-date' control message. Final offset: ${finalOffset}`);
+              // Log handle value when 'up-to-date' is received
+              console.log(`[Sync ${tableName}] stream.shapeHandle at up-to-date: ${stream.shapeHandle}`);
               resolve(); // Stop processing messages for this stream
             } else {
               console.log(`[Sync ${tableName}] Received other message type:`, JSON.stringify(msg, null, 2));
@@ -339,6 +355,11 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
       
     console.log(`[Sync ${tableName}] Stream processing complete. Total messages received: ${messageCount}. Change messages processed: ${changeMessageCount}. Operations in batch: ${currentBatch.length}.`);
     
+    // Get the shape handle AFTER the stream has potentially established it.
+    // Accessing it directly - adjust if library exposes it differently.
+    const currentShapeHandle = stream.shapeHandle ?? lastKnownShapeHandle;
+    console.log(`[Sync ${tableName}] Shape handle after stream processing: ${currentShapeHandle}`);
+
     // Apply changes and save offset only if we have changes
     if (currentBatch.length > 0) {
       console.log(`[Sync ${tableName}] Applying ${currentBatch.length} changes.`);
@@ -358,14 +379,6 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
         console.log(`[Sync ${tableName}] Row count after batch: ${newCount}`);
         
         if (finalOffset) {
-          // Attempt to get the shape handle from the stream instance
-          // IMPORTANT: This assumes the property exists; adjust if needed based on library specifics
-          const currentShapeHandle = (stream as any).shapeHandle ?? lastKnownShapeHandle;
-          
-          if (!currentShapeHandle) {
-              console.warn(`[Sync ${tableName}] Could not determine shape handle after sync. State might be incomplete.`);
-          }
-          
           console.log(`[Sync ${tableName}] Saving final state: offset=${finalOffset}, handle=${currentShapeHandle}`);
           await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
             .bind(tableName, finalOffset, currentShapeHandle)
@@ -388,11 +401,9 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
        // Even if no changes, update offset if we received one
        if (finalOffset) {
           // Attempt to get the shape handle from the stream instance
-          const currentShapeHandle = (stream as any).shapeHandle ?? lastKnownShapeHandle;
-
-         if (!currentShapeHandle) {
-             console.warn(`[Sync ${tableName}] Could not determine shape handle after sync (no changes). State might be incomplete.`);
-         }
+          if (!currentShapeHandle) {
+              console.warn(`[Sync ${tableName}] Could not determine shape handle after sync (stream.shapeHandle was likely undefined or null). State might be incomplete.`);
+          }
 
           console.log(`[Sync ${tableName}] Saving final state even though no changes applied: offset=${finalOffset}, handle=${currentShapeHandle}`);
           await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
@@ -403,7 +414,7 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
     }
   } catch (error) {
     // Catch errors from stream setup or promise handling
-    console.error(`[Sync ${tableName}] Critical error during sync process:`, error);
+    console.error(`[Sync ${tableName}] Critical error during sync stream setup or processing:`, error);
     // Do not re-throw, allow finally to release lock
   } finally {
     // Always release the lock
