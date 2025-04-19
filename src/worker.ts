@@ -33,17 +33,34 @@ interface SyncState {
   shapeHandle: string | undefined;
 }
 
+// Helper function for JSON stringify to handle BigInt
+function jsonReplacer(key: string, value: any): any {
+    if (typeof value === 'bigint') {
+        return value.toString();
+    }
+    return value;
+}
+
 // Function to convert values based on their type
 function convertValue(value: any, type: SQLiteType): any {
   if (value === null || value === undefined)
     return null;
 
+  // Always convert BigInt to Number or String if too large
+  // D1 driver might handle Numbers, but stringify and others might not.
+  // Let's convert to Number for smaller BigInts, string for larger ones.
+  if (typeof value === 'bigint') {
+      try {
+        return Number(value); // Try converting to Number first
+      } catch (e) {
+          // If Number conversion fails (too large), convert to string
+          console.warn(`[convertValue] BigInt too large for Number, converting to string: ${value.toString()}`);
+          return value.toString();
+      }
+  }
+
   switch (type) {
     case 'INTEGER':
-      // Handle bigint and timestamp values
-      if (typeof value === 'bigint') {
-        return Number(value);
-      }
       // Convert timestamp to unix timestamp if it's a date string
       if (typeof value === 'string' && value.includes('T')) {
         return Math.floor(new Date(value).getTime() / 1000);
@@ -59,7 +76,7 @@ function convertValue(value: any, type: SQLiteType): any {
           return value;
         } catch (e) {
           // Not valid JSON, stringify it
-          return JSON.stringify(value);
+          return JSON.stringify(value, jsonReplacer);
         }
       }
       
@@ -73,9 +90,10 @@ function convertValue(value: any, type: SQLiteType): any {
       }
       
       try {
-        return JSON.stringify(value);
+        return JSON.stringify(value, jsonReplacer);
       } catch (e) {
-        console.error("Error stringifying JSON:", e, "Value:", value);
+        // Use the replacer for safe logging here too
+        console.error("Error stringifying JSON:", e, "Value:", JSON.stringify(value, jsonReplacer));
         return null;
       }
     default:
@@ -88,9 +106,9 @@ function cleanFields(record: any, tableName: string): Record<string, any> {
   if (!record)
     return record;
 
-  const schema = TABLE_SCHEMAS_TYPES[tableName];
+  const schema = TABLE_SCHEMAS_TYPES[tableName as keyof typeof TABLE_SCHEMAS_TYPES];
   if (!schema) {
-    console.error(`Unknown table: ${tableName}`);
+    console.error(`[cleanFields ${tableName}] Unknown table schema`);
     return record;
   }
 
@@ -124,9 +142,6 @@ function handleMessage(msg: any, table: TableSchema) {
   const tableName = table.name;
   const columns = table.columns.filter(col => col !== table.primaryKey);
 
-  // Log the raw message received
-  console.log(`[${tableName}] Raw message received:`, JSON.stringify(msg, null, 2));
-
   try {
     // Validate input
     if (!value || typeof value !== 'object') {
@@ -136,7 +151,6 @@ function handleMessage(msg: any, table: TableSchema) {
 
     // Clean and convert the values
     const cleanedValue = cleanFields(value, tableName);
-    console.log(`[${tableName}] Cleaned value:`, JSON.stringify(cleanedValue, null, 2));
     
     // Values to insert/update
     const pkValue = cleanedValue[table.primaryKey];
@@ -179,14 +193,15 @@ function handleMessage(msg: any, table: TableSchema) {
     }
 
     if (operation) {
-      console.log(`[${tableName}] Generated SQL operation:`, JSON.stringify(operation, null, 2));
+      // console.log(`[${tableName}] Generated SQL operation:`, JSON.stringify(operation, jsonReplacer, 2)); // Removed: Too verbose
     } else {
        console.log(`[${tableName}] No SQL operation generated for message.`);
     }
     return operation;
 
   } catch (error) {
-    console.error(`[${tableName}] Error handling message:`, error, "Value:", JSON.stringify(value));
+    // Log only essential parts on error to avoid large logs
+    console.error(`[${tableName}] Error handling message:`, error, "PK:", value?.[table.primaryKey], "Operation:", headers?.operation);
     throw error; // Re-throw to be caught by the caller if necessary
   }
 }
@@ -302,10 +317,11 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
       ...(streamOptions.shapeHandle && { shapeHandle: streamOptions.shapeHandle }),
     };
 
-    console.log(`[Sync ${tableName}] Final ShapeStream options:`, JSON.stringify(typedStreamOptions, null, 2));
+    console.log(`[Sync ${tableName}] Final ShapeStream options:`, JSON.stringify(typedStreamOptions, jsonReplacer, 2));
     const stream = new ShapeStream(typedStreamOptions);
 
-    let currentBatch: any[] = [];
+    let currentBatch: D1PreparedStatement[] = []; // Use D1PreparedStatement type
+    const INTERNAL_BATCH_SIZE = 100; // Process in chunks of 100
     let finalOffset: Offset | undefined;
     let messageCount = 0;
     let changeMessageCount = 0;
@@ -317,15 +333,35 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
           messageCount += messages.length;
           console.log(`[Sync ${tableName}] Received ${messages.length} messages (total: ${messageCount}).`);
           for (const msg of messages) {
+            const currentMessageIndex = changeMessageCount + 1; // For progress logging
+
             if (isChangeMessage(msg)) {
               changeMessageCount++;
               try {
-                // console.log(`[Sync ${tableName}] Processing change message:`, JSON.stringify(msg, null, 2)); // Already logged in handleMessage
                 const sqlOperation = handleMessage(msg, table);
                 if (sqlOperation) {
-                  currentBatch.push(sqlOperation);
-                  // console.log(`[Sync ${tableName}] Added operation to batch. Batch size: ${currentBatch.length}`);
+                  // Prepare the statement immediately
+                  currentBatch.push(db.prepare(sqlOperation.sql).bind(...sqlOperation.params));
+
+                  // Check if internal batch size is reached
+                  if (currentBatch.length >= INTERNAL_BATCH_SIZE) {
+                      console.log(`[Sync ${tableName}] Internal batch size (${INTERNAL_BATCH_SIZE}) reached. Executing batch...`);
+                      try {
+                          const internalBatchResult = await db.batch(currentBatch);
+                          console.log(`[Sync ${tableName}] Internal batch executed. Results count: ${internalBatchResult.length}`);
+                          // Optional: Log detailed internal batch results if needed for debugging, but keep it concise
+                          // internalBatchResult.forEach((res, idx) => console.log(`  Item ${idx}: Success=${res.success}, Error=${res.error?.message}`));
+                      } catch (internalBatchError) {
+                          console.error(`[Sync ${tableName}] Error executing internal batch:`, internalBatchError);
+                          // Depending on desired behavior, you might want to stop processing, 
+                          // skip remaining messages, or try to continue.
+                          // For now, log the error and clear the batch to potentially continue.
+                      }
+                      currentBatch = []; // Reset for the next internal batch
+                      console.log(`[Sync ${tableName}] Internal batch cleared.`);
+                  }
                 } else {
+                  // Log if handleMessage unexpectedly returns null
                   console.warn(`[Sync ${tableName}] handleMessage returned null for a change message.`);
                 }
               } catch (error) {
@@ -340,7 +376,13 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
               console.log(`[Sync ${tableName}] stream.shapeHandle at up-to-date: ${stream.shapeHandle}`);
               resolve(); // Stop processing messages for this stream
             } else {
-              console.log(`[Sync ${tableName}] Received other message type:`, JSON.stringify(msg, null, 2));
+              // Only log non-change/non-up-to-date messages if necessary
+              console.log(`[Sync ${tableName}] Received non-change/non-up-to-date message type:`, msg?.headers?.control || 'Unknown type');
+            }
+
+            // Log progress every 100 messages
+            if (currentMessageIndex % 100 === 0) {
+                console.log(`[Sync ${tableName}] Processed message ${currentMessageIndex}/${messageCount}... Batch size: ${currentBatch.length}`);
             }
           }
           console.log(`[Sync ${tableName}] Finished processing batch of ${messages.length} messages. Change messages processed: ${changeMessageCount}. Batch size: ${currentBatch.length}.`);
@@ -353,6 +395,7 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
 
     }); // End of Promise
       
+    console.log(`[Sync ${tableName}] Stream promise resolved. Proceeding to batch processing.`);
     console.log(`[Sync ${tableName}] Stream processing complete. Total messages received: ${messageCount}. Change messages processed: ${changeMessageCount}. Operations in batch: ${currentBatch.length}.`);
     
     // Get the shape handle AFTER the stream has potentially established it.
@@ -360,57 +403,38 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
     const currentShapeHandle = stream.shapeHandle ?? lastKnownShapeHandle;
     console.log(`[Sync ${tableName}] Shape handle after stream processing: ${currentShapeHandle}`);
 
-    // Apply changes and save offset only if we have changes
+    // Process any remaining items in the batch after the loop finishes
     if (currentBatch.length > 0) {
-      console.log(`[Sync ${tableName}] Applying ${currentBatch.length} changes.`);
-      try {
-        // Log first few SQL statements for debugging
-        const sampleSize = Math.min(currentBatch.length, 5); // Increased sample size
-        console.log(`[Sync ${tableName}] Sample SQL statements (${sampleSize}/${currentBatch.length}):`,
-          JSON.stringify(currentBatch.slice(0, sampleSize), null, 2)); // Use JSON.stringify for better readability
-
-        console.log(`[Sync ${tableName}] Executing batch...`);
-        const batchResult = await db.batch(currentBatch);
-        console.log(`[Sync ${tableName}] Batch execution result:`, JSON.stringify(batchResult, null, 2));
-        
-        // Verify changes were applied by checking count again
-        const countResult = await db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
-        const newCount = countResult?.count ?? 'N/A';
-        console.log(`[Sync ${tableName}] Row count after batch: ${newCount}`);
-        
-        if (finalOffset) {
-          console.log(`[Sync ${tableName}] Saving final state: offset=${finalOffset}, handle=${currentShapeHandle}`);
-          await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
-            .bind(tableName, finalOffset, currentShapeHandle)
-            .run();
-          console.log(`[Sync ${tableName}] Final sync state saved.`);
-        } else {
-          console.warn(`[Sync ${tableName}] No final offset received, cannot update sync_state.`);
+        console.log(`[Sync ${tableName}] Executing final batch of ${currentBatch.length} remaining items...`);
+        try {
+            const finalBatchResult = await db.batch(currentBatch);
+            console.log(`[Sync ${tableName}] Final batch executed. Results count: ${finalBatchResult.length}`);
+        } catch (finalBatchError) {
+            console.error(`[Sync ${tableName}] Error executing final batch:`, finalBatchError);
+            // If the final batch fails, we might not want to save the offset.
+            // Consider how to handle this - for now, log and continue to state saving.
         }
-        console.log(`[Sync ${tableName}] Sync completed successfully in ${Date.now() - start}ms.`);
-      } catch (error) {
-        console.error(`[Sync ${tableName}] Error executing batch:`, error);
-        // Log a sample of the batch that caused the error
-        const sampleSize = Math.min(currentBatch.length, 5);
-        console.error(`[Sync ${tableName}] Sample of ${sampleSize}/${currentBatch.length} batch items that potentially caused the error:`, 
-          JSON.stringify(currentBatch.slice(0, sampleSize), null, 2));
-        // Do not re-throw here, let the finally block handle lock release
-      }
-    } else {
-      console.log(`[Sync ${tableName}] No changes to apply.`);
-       // Even if no changes, update offset if we received one
-       if (finalOffset) {
-          // Attempt to get the shape handle from the stream instance
-          if (!currentShapeHandle) {
-              console.warn(`[Sync ${tableName}] Could not determine shape handle after sync (stream.shapeHandle was likely undefined or null). State might be incomplete.`);
-          }
+        currentBatch = []; // Clear final batch
+    }
 
-          console.log(`[Sync ${tableName}] Saving final state even though no changes applied: offset=${finalOffset}, handle=${currentShapeHandle}`);
-          await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
-            .bind(tableName, finalOffset, currentShapeHandle)
-            .run();
-          console.log(`[Sync ${tableName}] Final sync state saved.`);
-       }
+    // Save the final state (offset/handle) regardless of whether the last batch had items,
+    // as long as an offset was received from the stream.
+    if (finalOffset) {
+        console.log(`[Sync ${tableName}] Proceeding to save final sync state.`);
+        try {
+            if (!currentShapeHandle) {
+                 console.warn(`[Sync ${tableName}] Final offset received, but could not determine shape handle after sync. Saving state without handle.`);
+            }
+            console.log(`[Sync ${tableName}] Saving final state: offset=${finalOffset}, handle=${currentShapeHandle ?? null}`); // Save null if undefined
+            const stateSaveResult = await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
+                .bind(tableName, finalOffset, currentShapeHandle ?? null) // Bind null if undefined
+                .run();
+            console.log(`[Sync ${tableName}] Final sync state save result:`, JSON.stringify(stateSaveResult, jsonReplacer, 2));
+        } catch (error) {
+            console.error(`[Sync ${tableName}] Error saving final sync state:`, error);
+        }
+    } else {
+        console.log(`[Sync ${tableName}] No final offset received from stream, cannot update sync_state.`);
     }
   } catch (error) {
     // Catch errors from stream setup or promise handling
@@ -546,7 +570,7 @@ async function handleNuke(request: Request, env: Env) {
   let body: NukeRequest;
   try {
     body = await request.json() as NukeRequest;
-    console.log(`[Nuke] Parsed request body:`, JSON.stringify(body));
+    console.log(`[Nuke] Parsed request body:`, JSON.stringify(body, jsonReplacer));
   } catch (e) {
      console.error(`[Nuke] Error parsing request body:`, e);
      return new Response("Invalid request body", { status: 400 });
@@ -716,7 +740,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
   let body: SyncRequest;
   try {
     body = await request.json() as SyncRequest;
-    console.log(`[Sync Request] Parsed request body:`, JSON.stringify(body));
+    console.log(`[Sync Request] Parsed request body:`, JSON.stringify(body, jsonReplacer));
   } catch (e) {
     console.error(`[Sync Request] Error parsing request body:`, e);
     return new Response("Invalid request body", { status: 400 });
@@ -840,7 +864,7 @@ export default {
             },
             body: JSON.stringify({
               table: table.name
-            })
+            }, jsonReplacer)
           }).then(async response => {
              // Log the response from the /sync endpoint
              const status = response.status;
