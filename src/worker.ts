@@ -12,15 +12,12 @@ import {
 // import { Pool, type PoolClient } from 'pg'; // Removed pg Pool
 import postgres from 'postgres'; // Use default import
 
-// Define a constant for the maximum number of D1 queries per run
-const MAX_QUERIES_PER_RUN = 1000;
+// Define constants
+const BATCH_SIZE = 998; // D1 batch size for statements
 
 interface Env {
   DB: D1Database;
   WEBHOOK_SECRET: string;
-  WORKER_BASE_URL?: string; // Add optional base URL for self-fetch
-  SUPABASE_URL: string; // Add Supabase URL
-  SUPABASE_SERVICE_ROLE_KEY: string; // Add Supabase service role key
   CUSTOM_SUPABASE_DB_URL: string; // Add direct DB URL
 }
 
@@ -454,8 +451,6 @@ async function processReplicationQueue(db: D1Database, env: Env) {
     let processedMsgCount = 0;
     let lastSuccessfullyProcessedMsgId = -1; // Track the last ID successfully processed *before* batch commit
     let currentBatch: D1PreparedStatement[] = [];
-    const BATCH_SIZE = 998; // D1 batch size
-    let totalQueriesPrepared = 0;
     let highestMsgIdRead = -1; // Track the highest message ID read in this run
     const successfullyProcessedMsgIds: bigint[] = []; // Collect IDs for deletion
     let batchMsgIds: bigint[] = []; // Track IDs in the current D1 batch
@@ -510,13 +505,6 @@ async function processReplicationQueue(db: D1Database, env: Env) {
             currentMsgId = pgmqMsg.msg_id;
             const currentMsgIdBigInt = BigInt(currentMsgId); // Convert to BigInt early
 
-            // Check if we've exceeded the total query limit for this run
-            if (totalQueriesPrepared >= MAX_QUERIES_PER_RUN) {
-                 console.log(`[${queueKey}] Reached query limit (${MAX_QUERIES_PER_RUN}). Stopping processing for this run after msg_id ${lastSuccessfullyProcessedMsgId}.`);
-                 currentMsgId = -1; // Signal to break outer loop processing
-                 break; // Stop processing more messages
-            }
-
             try {
                 // a. Parse message content & get target table
                 const msgContent = pgmqMsg.message;
@@ -546,7 +534,6 @@ async function processReplicationQueue(db: D1Database, env: Env) {
                     // c. Add statement to batch
                     currentBatch.push(db.prepare(sqlOperation.sql).bind(...sqlOperation.params));
                     batchMsgIds.push(currentMsgIdBigInt); // Add ID to current batch tracker
-                    totalQueriesPrepared++;
                     
                     // d. If D1 batch size reached, execute batch
                     if (currentBatch.length >= BATCH_SIZE) {
@@ -629,9 +616,6 @@ export default {
     const path = url.pathname;
     console.log(`[Fetch] Received request: ${request.method} ${path}`);
     
-    // Log essential env vars (avoid secrets)
-    console.log(`[Fetch] Env SUPABASE_URL: ${env.SUPABASE_URL ? 'Set' : 'Not Set'}`);
-    // WORKER_BASE_URL is no longer needed for scheduled handler
     
     try {
         if (path === "/nuke") {
