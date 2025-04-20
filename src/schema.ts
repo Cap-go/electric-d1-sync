@@ -1,6 +1,3 @@
-import { sqltag } from 'sql-template-tag';
-import type { D1Database } from '@cloudflare/workers-types';
-
 export type SQLiteType = 'INTEGER' | 'TEXT' | 'BOOLEAN' | 'JSON';
 
 // Single source of truth for table definitions
