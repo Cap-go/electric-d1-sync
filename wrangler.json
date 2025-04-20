@@ -1,5 +1,5 @@
 {
-  "name": "electric-d1-sync",
+  "name": "supabase-d1-sync",
   "main": "src/worker.ts",
   "route": {
     "pattern": "sync.capgo.app",
@@ -19,8 +19,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "electric-sync",
-      "database_id": "6562b76d-bcb8-42a7-907d-5fbb2db81e81"
+      "database_name": "capgo_prod_replicate",
+      "database_id": "7f267d86-f4f7-49f5-9622-e44373aa00dc"
     }
   ]
 } 
