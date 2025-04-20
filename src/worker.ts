@@ -321,7 +321,7 @@ async function syncTable(db: D1Database, table: TableSchema, env: Env) {
     const stream = new ShapeStream(typedStreamOptions);
 
     let currentBatch: D1PreparedStatement[] = []; // Use D1PreparedStatement type
-    const INTERNAL_BATCH_SIZE = 100; // Process in chunks of 100
+    const INTERNAL_BATCH_SIZE = 1000; // Process in chunks of 100
     let finalOffset: Offset | undefined;
     let messageCount = 0;
     let changeMessageCount = 0;
@@ -722,6 +722,7 @@ async function checkAndCreateSpecificTable(db: D1Database, tableName: string) {
 }
 
 async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionContext) {
+  const handlerStart = Date.now();
   console.log(`[Sync Request] Received sync request to ${request.url}`);
   // Validate request method
   if (request.method !== "POST") {
@@ -758,10 +759,10 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
     console.log(`[Sync Request] Valid table specified: ${tableName}`);
     
     // Removed checkAndCreateSpecificTable - assuming scheduled handler ensures tables exist first.
-    console.log(`[Sync Request] Scheduling background sync (table existence checked by scheduled handler).`);
+    console.log(`[Sync Request] Scheduling background sync (table existence checked by scheduled handler). Time: ${Date.now() - handlerStart}ms`);
     
     // Run the sync in the background using waitUntil
-    console.log(`[Sync Request] Scheduling background sync for ${tableName}.`);
+    console.log(`[Sync Request] Calling ctx.waitUntil for ${tableName}. Time: ${Date.now() - handlerStart}ms`);
     ctx.waitUntil(
       (async () => {
         console.log(`[Background Sync ${tableName}] Starting background execution.`);
@@ -777,7 +778,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
     );
     
     // Return success immediately while the sync continues in the background
-    console.log(`[Sync Request] Responding 202 Accepted for ${tableName}.`);
+    console.log(`[Sync Request] Responding 202 Accepted for ${tableName}. Time: ${Date.now() - handlerStart}ms`);
     return new Response(`Sync scheduled for ${tableName}`, { status: 202 });
   } catch (error) {
     // Catch errors from validation, table checking, or scheduling
@@ -821,22 +822,22 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const startTime = Date.now();
-    console.log(`[Scheduled] Cron triggered at: ${new Date(event.scheduledTime).toISOString()}`);
+    console.log(`[Scheduled ${startTime}] Cron triggered at: ${new Date(event.scheduledTime).toISOString()}`);
     
     // Log essential env vars (avoid secrets)
-    console.log(`[Scheduled] Env ELECTRIC_URL: ${env.ELECTRIC_URL ? 'Set' : 'Not Set'}`);
-    console.log(`[Scheduled] Env ELECTRIC_SOURCE_ID: ${env.ELECTRIC_SOURCE_ID ? 'Set' : 'Not Set'}`);
-    console.log(`[Scheduled] Env WEBHOOK_SECRET: ${env.WEBHOOK_SECRET ? 'Set' : 'Not Set'}`);
+    console.log(`[Scheduled ${startTime}] Env ELECTRIC_URL: ${env.ELECTRIC_URL ? 'Set' : 'Not Set'}`);
+    console.log(`[Scheduled ${startTime}] Env ELECTRIC_SOURCE_ID: ${env.ELECTRIC_SOURCE_ID ? 'Set' : 'Not Set'}`);
+    console.log(`[Scheduled ${startTime}] Env WEBHOOK_SECRET: ${env.WEBHOOK_SECRET ? 'Set' : 'Not Set'}`);
 
 
     try {
       // Initialize database first - ensures sync tables exist before triggering syncs
-      console.log(`[Scheduled] Initializing database tables...`);
+      console.log(`[Scheduled ${startTime}] Initializing database tables... Time: ${Date.now() - startTime}ms`);
       await checkAndCreateTables(env.DB);
-      console.log(`[Scheduled] Database tables initialized.`);
+      console.log(`[Scheduled ${startTime}] Database tables initialized. Time: ${Date.now() - startTime}ms`);
       
-      // Trigger individual sync requests for each table via fetch to self
-      const promises = [];
+      // Helper function for delay
+      const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
       
       // Determine the worker URL dynamically - THIS IS CRUCIAL
       // Assuming the worker is accessible via a default route or custom domain.
@@ -846,46 +847,52 @@ export default {
       // Option 3: Use an environment variable (Recommended)
       const workerBaseUrl = env.WORKER_BASE_URL || "https://sync.capgo.app"; // Default, but override with env var
       if (!workerBaseUrl) {
-          console.error("[Scheduled] WORKER_BASE_URL environment variable is not set. Cannot trigger sync requests.");
+          console.error(`[Scheduled ${startTime}] WORKER_BASE_URL environment variable is not set. Cannot trigger sync requests.`);
           return; // Stop if we don't know where to send requests
       }
-       console.log(`[Scheduled] Using worker base URL: ${workerBaseUrl}`);
-
+      console.log(`[Scheduled ${startTime}] Using worker base URL: ${workerBaseUrl}`);
       
+      console.log(`[Scheduled ${startTime}] Starting staggered sync triggers... Time: ${Date.now() - startTime}ms`);
       for (const table of TABLES) {
         const syncUrl = new URL("/sync", workerBaseUrl); // Use WORKER_BASE_URL
-        console.log(`[Scheduled] Triggering sync POST request to: ${syncUrl.toString()} for table ${table.name}`);
-        promises.push(
-          fetch(syncUrl.toString(), {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-webhook-signature": env.WEBHOOK_SECRET // Use the secret to authenticate the self-request
-            },
-            body: JSON.stringify({
-              table: table.name
-            }, jsonReplacer)
-          }).then(async response => {
-             // Log the response from the /sync endpoint
-             const status = response.status;
-             const text = await response.text();
-             console.log(`[Scheduled] Response from triggering ${table.name}: Status ${status}, Body: ${text}`);
-             if (!response.ok) {
-                console.error(`[Scheduled] Failed to trigger sync for ${table.name}. Status: ${status}, Body: ${text}`);
-             }
-          }).catch(error => {
-             console.error(`[Scheduled] Error triggering sync fetch for ${table.name}:`, error);
-          })
-        );
+        
+        // Stagger the requests
+        await delay(200); // Wait 200ms before triggering the next one
+        console.log(`[Scheduled ${startTime}] Triggering fetch for ${table.name}... Time: ${Date.now() - startTime}ms`);
+
+        // Using waitUntil: Fire-and-forget the trigger. Response/errors handled in background.
+        ctx.waitUntil((async () => {
+           const triggerStart = Date.now();
+           try {
+              const response = await fetch(syncUrl.toString(), {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-webhook-signature": env.WEBHOOK_SECRET // Use the secret to authenticate the self-request
+                },
+                body: JSON.stringify({
+                   table: table.name
+                })
+              });
+              // Log the response from the /sync endpoint *within* waitUntil
+              const status = response.status;
+              const text = await response.text();
+              console.log(`[Scheduled ${startTime} -> WaitUntil ${table.name}] Trigger Response: Status ${status}, Body: ${text}. Trigger Duration: ${Date.now() - triggerStart}ms`);
+              if (!response.ok) {
+                   console.error(`[Scheduled ${startTime} -> WaitUntil ${table.name}] Trigger failed: Status ${status}, Body: ${text}`);
+               }
+           } catch(error) {
+              // Log fetch errors *within* waitUntil
+              console.error(`[Scheduled ${startTime} -> WaitUntil ${table.name}] Trigger fetch error:`, error);
+           }
+        })());
       }
       
-      // Wait for all trigger fetch requests to be initiated (doesn't wait for syncs to complete)
-      console.log(`[Scheduled] Waiting for all ${promises.length} sync triggers to be sent...`);
-      await Promise.all(promises);
-      console.log(`[Scheduled] All sync triggers sent. Cron execution finished in ${Date.now() - startTime}ms.`);
+      // Removed Promise.all as we are now awaiting each fetch sequentially with delays
+      console.log(`[Scheduled ${startTime}] All sync triggers sent sequentially. Cron execution finished in ${Date.now() - startTime}ms.`);
     } catch (error) {
       // Catch errors from checkAndCreateTables or fetch triggering logic
-      console.error("[Scheduled] Error during scheduled execution:", error);
+      console.error(`[Scheduled ${startTime}] Error during scheduled execution:`, error);
       // Consider adding monitoring/alerting here
     }
   }
