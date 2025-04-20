@@ -1,24 +1,22 @@
 {
   "name": "electric-d1-sync",
-  "module": "src/worker.ts",
-  "type": "module",
+  "version": "0.0.0",
+  "private": true,
   "scripts": {
     "deploy:secrets": "wrangler secret bulk .env",
-    "deploy": "wrangler deploy && wrangler secret bulk .env",
-    "deploy:dev": "wrangler deploy --env=development && wrangler secret bulk .env.development --env=development"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240208.0",
-    "@types/bun": "latest",
-    "wrangler": "^4.11.1",
-    "sql-template-tag": "^3.0.0"
-  },
-  "peerDependencies": {
-    "typescript": "^5.0.0"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev"
   },
   "dependencies": {
-    "@electric-sql/client": "^1.0.0-beta.4",
-    "@types/better-sqlite3": "^7.6.12",
-    "better-sqlite3": "^11.8.1"
+    "@supabase/supabase-js": "^2.45.0",
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250420.0",
+    "@types/node": "^20.14.10",
+    "bun-types": "latest",
+    "typescript": "^5.5.3",
+    "wrangler": "4"
   }
 }

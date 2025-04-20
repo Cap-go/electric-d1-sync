@@ -1,6 +1,5 @@
 /// <reference types="@cloudflare/workers-types" />
 
-import { ShapeStream, isChangeMessage, isControlMessage, type Offset, type Row } from "@electric-sql/client";
 import { 
   TABLE_SCHEMAS_TYPES,
   UUID_COLUMNS,
@@ -9,28 +8,25 @@ import {
   TableSchema,
   SQLiteType,
 } from "./schema.ts";
+// import { createClient, SupabaseClient } from '@supabase/supabase-js'; // Removed Supabase client
+// import { Pool, type PoolClient } from 'pg'; // Removed pg Pool
+import postgres from 'postgres'; // Use default import
+
+// Define a constant for the maximum number of D1 queries per run
+const MAX_QUERIES_PER_RUN = 1000;
 
 interface Env {
   DB: D1Database;
-  ELECTRIC_URL: string;
   WEBHOOK_SECRET: string;
-  ELECTRIC_SOURCE_ID: string;
-  ELECTRIC_SOURCE_SECRET: string;
   WORKER_BASE_URL?: string; // Add optional base URL for self-fetch
+  SUPABASE_URL: string; // Add Supabase URL
+  SUPABASE_SERVICE_ROLE_KEY: string; // Add Supabase service role key
+  CUSTOM_SUPABASE_DB_URL: string; // Add direct DB URL
 }
 
 interface NukeRequest {
   type: 'all' | 'table';
   table?: string;
-}
-
-interface SyncRequest {
-  table: string;
-}
-
-interface SyncState {
-  offset: Offset | undefined;
-  shapeHandle: string | undefined;
 }
 
 // Helper function for JSON stringify to handle BigInt
@@ -137,16 +133,29 @@ function cleanFields(record: any, tableName: string): Record<string, any> {
 }
 
 // Update handleMessage function to use the new schema structure
-function handleMessage(msg: any, table: TableSchema) {
-  const { headers, value } = msg;
+// Adapts to the message format from trigger_http_queue_post_to_function_d1
+function handleMessage(pgmqMsg: any, table: TableSchema) {
+  // Assume pgmqMsg format: { msg_id: number, ..., message: { record: object | null, old_record: object | null, type: string, table: string } }
+  const { msg_id, message } = pgmqMsg;
+  // Extract operation type and determine the relevant data record based on the operation type
+  const opType = message?.type?.toUpperCase(); 
   const tableName = table.name;
   const columns = table.columns.filter(col => col !== table.primaryKey);
+  
+  let value: any = null;
+  if (opType === 'INSERT' || opType === 'UPDATE') {
+    value = message.record;
+  } else if (opType === 'DELETE') {
+    value = message.old_record; // Use old_record for DELETE to get the PK
+  }
+
+  console.log(`[Handle PGMQ ${tableName}] Processing msg_id: ${msg_id}, op: ${opType}`);
 
   try {
-    // Validate input
+    // Validate input based on pgmq message format
     if (!value || typeof value !== 'object') {
-      console.error(`[${tableName}] Invalid message value:`, value);
-      throw new Error(`Invalid message value for table ${tableName}`);
+      console.error(`[PGMQ ${tableName}] Invalid or missing message data (record/old_record) in msg_id ${msg_id}:`, message);
+      throw new Error(`Invalid or missing message data for table ${tableName}, msg_id ${msg_id}, operation ${opType}`);
     }
 
     // Clean and convert the values
@@ -157,51 +166,56 @@ function handleMessage(msg: any, table: TableSchema) {
     
     // Handle missing primary key
     if (pkValue === undefined || pkValue === null) {
-      console.error(`[${tableName}] Missing primary key:`, value);
-      throw new Error(`Missing primary key for table ${tableName}`);
+      console.error(`[PGMQ ${tableName}] Missing primary key in data for msg_id ${msg_id}:`, value);
+      throw new Error(`Missing primary key for table ${tableName}, msg_id ${msg_id}, operation ${opType}`);
     }
     
     // Map column values, defaulting to null for missing values
-    const values = columns.map(col => {
+    // Only needed for INSERT/UPDATE
+    let values: any[] = [];
+    if (opType === 'INSERT' || opType === 'UPDATE') {
+        values = columns.map(col => {
       const val = cleanedValue[col];
       return val === undefined ? null : val;
     });
+    }
 
     let operation: { sql: string; params: any[] } | null = null;
-    switch (headers.operation) {
-      case "insert":
+
+    switch (opType) {
+      case "INSERT": // Assuming pgmq type is uppercase
         operation = {
           sql: `INSERT OR REPLACE INTO ${tableName} (${table.columns.join(", ")}) VALUES (${table.columns.map(() => "?").join(", ")})`,
           params: [pkValue, ...values],
         };
         break;
-      case "update":
+      case "UPDATE": // Assuming pgmq type is uppercase
         operation = {
           sql: `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(", ")} WHERE ${table.primaryKey} = ?`,
           params: [...values, pkValue],
         };
         break;
-      case "delete":
+      case "DELETE": // Assuming pgmq type is uppercase
         operation = {
           sql: `DELETE FROM ${tableName} WHERE ${table.primaryKey} = ?`,
           params: [pkValue],
         };
         break;
       default:
-        console.error(`[${tableName}] Unknown operation: ${headers.operation}`);
-        throw new Error(`Unknown operation: ${headers.operation}`);
+        console.error(`[PGMQ ${tableName}] Unknown operation from pgmq message type: ${opType} in msg_id ${msg_id}`);
+        throw new Error(`Unknown operation type: ${opType}`);
     }
 
     if (operation) {
-      // console.log(`[${tableName}] Generated SQL operation:`, JSON.stringify(operation, jsonReplacer, 2)); // Removed: Too verbose
+      // console.log(`[PGMQ ${tableName}] Generated SQL operation for msg_id ${msg_id}:`, JSON.stringify(operation, jsonReplacer, 2));
     } else {
-       console.log(`[${tableName}] No SQL operation generated for message.`);
+       console.log(`[PGMQ ${tableName}] No SQL operation generated for message msg_id ${msg_id}.`);
     }
     return operation;
 
   } catch (error) {
     // Log only essential parts on error to avoid large logs
-    console.error(`[${tableName}] Error handling message:`, error, "PK:", value?.[table.primaryKey], "Operation:", headers?.operation);
+    console.error(`[PGMQ ${tableName}] Error handling message msg_id ${msg_id}:`, error, "PK:", value?.[table.primaryKey], "Operation:", opType);
     throw error; // Re-throw to be caught by the caller if necessary
   }
 }
@@ -210,7 +224,7 @@ async function checkAndCreateTables(db: D1Database) {
   const start = Date.now();
   console.log(`[DB Init] Starting database table check/creation...`);
   try {
-    // Check each table with a simple SELECT
+    // Check each data table with a simple SELECT
     for (const table of Object.keys(TABLE_SCHEMAS)) {
       console.log(`[DB Init] Checking/Creating table: ${table}`);
       await ensureTableExists(db, table);
@@ -233,7 +247,9 @@ async function ensureTableExists(db: D1Database, table: string) {
     // If table doesn't exist, create it
     if (error instanceof Error && error.message.includes('no such table')) {
       console.log(`[Ensure Table] Table ${table} does not exist. Creating...`);
+      
       const schema = TABLE_SCHEMAS[table as keyof typeof TABLE_SCHEMAS];
+
       if (!schema) {
         console.error(`[Ensure Table] Schema not found for table: ${table}`);
         throw new Error(`Schema not found for table: ${table}`);
@@ -253,302 +269,6 @@ async function ensureTableExists(db: D1Database, table: string) {
       console.error(`[Ensure Table] Error checking table ${table}:`, error);
       throw error; // Re-throw unexpected error
     }
-  }
-}
-
-async function syncTable(db: D1Database, table: TableSchema, env: Env) {
-  const start = Date.now();
-  const tableName = table.name;
-  console.log(`[Sync ${tableName}] Starting sync process.`);
-  
-  // Try to acquire lock for this table
-  console.log(`[Sync ${tableName}] Attempting to acquire lock.`);
-  const hasLock = await acquireLock(db, tableName);
-  if (!hasLock) {
-    console.log(`[Sync ${tableName}] Could not acquire lock (already held or error). Skipping sync.`);
-    return;
-  }
-  console.log(`[Sync ${tableName}] Lock acquired.`);
-  
-  try {
-    // Get last known offset AND shape handle
-    const { offset: lastKnownOffset, shapeHandle: lastKnownShapeHandle } = await getLastSyncState(db, tableName);
-    console.log(`[Sync ${tableName}] Last known state: offset=${lastKnownOffset}, handle=${lastKnownShapeHandle}`);
-    
-    console.log(`[Sync ${tableName}] Creating ShapeStream to ${env.ELECTRIC_URL} for table ${tableName}`);
-    
-    // Prepare params, including shapeHandle if not an initial sync
-    const customParams: Record<string, any> = {
-        table: tableName,
-        replica: "full",
-        columns: table.columns,
-        source_id: env.ELECTRIC_SOURCE_ID,
-        source_secret: env.ELECTRIC_SOURCE_SECRET,
-    };
-
-    // Prepare constructor options, including offset and shapeHandle if applicable
-    const streamOptions: Record<string, any> = {
-        url: env.ELECTRIC_URL,
-        params: customParams, // Pass only custom params here
-        subscribe: false, // We want a snapshot, not continuous sync
-    };
-
-    if (lastKnownOffset) {
-        streamOptions.offset = lastKnownOffset;
-        console.log(`[Sync ${tableName}] Setting stream offset: ${lastKnownOffset}`);
-
-        if (lastKnownShapeHandle) {
-             streamOptions.shapeHandle = lastKnownShapeHandle; // Assuming shapeHandle is also a top-level option
-             console.log(`[Sync ${tableName}] Setting stream shape handle: ${lastKnownShapeHandle}`);
-        } else {
-             console.warn(`[Sync ${tableName}] Performing incremental sync (offset=${lastKnownOffset}) but no shape handle found.`);
-             // Electric client should handle this if shapeHandle is required
-        }
-    } else {
-         console.log(`[Sync ${tableName}] Performing initial sync (no offset/handle).`);
-    }
-
-    // Ensure options match the expected ShapeStreamOptions type
-    const typedStreamOptions: import("@electric-sql/client").ShapeStreamOptions = {
-      url: env.ELECTRIC_URL,
-      params: customParams,
-      subscribe: false,
-      ...(streamOptions.offset && { offset: streamOptions.offset }),
-      ...(streamOptions.shapeHandle && { shapeHandle: streamOptions.shapeHandle }),
-    };
-
-    console.log(`[Sync ${tableName}] Final ShapeStream options:`, JSON.stringify(typedStreamOptions, jsonReplacer, 2));
-    const stream = new ShapeStream(typedStreamOptions);
-
-    let currentBatch: D1PreparedStatement[] = []; // Use D1PreparedStatement type
-    const INTERNAL_BATCH_SIZE = 1000; // Process in chunks of 100
-    let finalOffset: Offset | undefined;
-    let messageCount = 0;
-    let changeMessageCount = 0;
-
-    console.log(`[Sync ${tableName}] Subscribing to stream...`);
-    await new Promise<void>((resolve, reject) => {
-      stream.subscribe(
-        async (messages) => {
-          messageCount += messages.length;
-          console.log(`[Sync ${tableName}] Received ${messages.length} messages (total: ${messageCount}).`);
-          for (const msg of messages) {
-            const currentMessageIndex = changeMessageCount + 1; // For progress logging
-
-            if (isChangeMessage(msg)) {
-              changeMessageCount++;
-              try {
-                const sqlOperation = handleMessage(msg, table);
-                if (sqlOperation) {
-                  // Prepare the statement immediately
-                  currentBatch.push(db.prepare(sqlOperation.sql).bind(...sqlOperation.params));
-
-                  // Check if internal batch size is reached
-                  if (currentBatch.length >= INTERNAL_BATCH_SIZE) {
-                      console.log(`[Sync ${tableName}] Internal batch size (${INTERNAL_BATCH_SIZE}) reached. Executing batch...`);
-                      try {
-                          const internalBatchResult = await db.batch(currentBatch);
-                          console.log(`[Sync ${tableName}] Internal batch executed. Results count: ${internalBatchResult.length}`);
-                          // Optional: Log detailed internal batch results if needed for debugging, but keep it concise
-                          // internalBatchResult.forEach((res, idx) => console.log(`  Item ${idx}: Success=${res.success}, Error=${res.error?.message}`));
-                      } catch (internalBatchError) {
-                          console.error(`[Sync ${tableName}] Error executing internal batch:`, internalBatchError);
-                          // Depending on desired behavior, you might want to stop processing, 
-                          // skip remaining messages, or try to continue.
-                          // For now, log the error and clear the batch to potentially continue.
-                      }
-                      currentBatch = []; // Reset for the next internal batch
-                      console.log(`[Sync ${tableName}] Internal batch cleared.`);
-                  }
-                } else {
-                  // Log if handleMessage unexpectedly returns null
-                  console.warn(`[Sync ${tableName}] handleMessage returned null for a change message.`);
-                }
-              } catch (error) {
-                // Error is logged within handleMessage
-                console.error(`[Sync ${tableName}] Skipping message due to error in handleMessage.`, error);
-                // Continue processing other messages
-              }
-            } else if (isControlMessage(msg) && msg.headers.control === "up-to-date") {
-              finalOffset = stream.lastOffset;
-              console.log(`[Sync ${tableName}] Received 'up-to-date' control message. Final offset: ${finalOffset}`);
-              // Log handle value when 'up-to-date' is received
-              console.log(`[Sync ${tableName}] stream.shapeHandle at up-to-date: ${stream.shapeHandle}`);
-              resolve(); // Stop processing messages for this stream
-            } else {
-              // Only log non-change/non-up-to-date messages if necessary
-              console.log(`[Sync ${tableName}] Received non-change/non-up-to-date message type:`, msg?.headers?.control || 'Unknown type');
-            }
-
-            // Log progress every 100 messages
-            if (currentMessageIndex % 100 === 0) {
-                console.log(`[Sync ${tableName}] Processed message ${currentMessageIndex}/${messageCount}... Batch size: ${currentBatch.length}`);
-            }
-          }
-          console.log(`[Sync ${tableName}] Finished processing batch of ${messages.length} messages. Change messages processed: ${changeMessageCount}. Batch size: ${currentBatch.length}.`);
-        },
-        (error: Error) => {
-          console.error(`[Sync ${tableName}] Stream subscription error:`, error);
-          reject(error); // Reject the promise on stream error
-        }
-      );
-
-    }); // End of Promise
-      
-    console.log(`[Sync ${tableName}] Stream promise resolved. Proceeding to batch processing.`);
-    console.log(`[Sync ${tableName}] Stream processing complete. Total messages received: ${messageCount}. Change messages processed: ${changeMessageCount}. Operations in batch: ${currentBatch.length}.`);
-    
-    // Get the shape handle AFTER the stream has potentially established it.
-    // Accessing it directly - adjust if library exposes it differently.
-    const currentShapeHandle = stream.shapeHandle ?? lastKnownShapeHandle;
-    console.log(`[Sync ${tableName}] Shape handle after stream processing: ${currentShapeHandle}`);
-
-    // Process any remaining items in the batch after the loop finishes
-    if (currentBatch.length > 0) {
-        console.log(`[Sync ${tableName}] Executing final batch of ${currentBatch.length} remaining items...`);
-        try {
-            const finalBatchResult = await db.batch(currentBatch);
-            console.log(`[Sync ${tableName}] Final batch executed. Results count: ${finalBatchResult.length}`);
-        } catch (finalBatchError) {
-            console.error(`[Sync ${tableName}] Error executing final batch:`, finalBatchError);
-            // If the final batch fails, we might not want to save the offset.
-            // Consider how to handle this - for now, log and continue to state saving.
-        }
-        currentBatch = []; // Clear final batch
-    }
-
-    // Save the final state (offset/handle) regardless of whether the last batch had items,
-    // as long as an offset was received from the stream.
-    if (finalOffset) {
-        console.log(`[Sync ${tableName}] Proceeding to save final sync state.`);
-        try {
-            if (!currentShapeHandle) {
-                 console.warn(`[Sync ${tableName}] Final offset received, but could not determine shape handle after sync. Saving state without handle.`);
-            }
-            console.log(`[Sync ${tableName}] Saving final state: offset=${finalOffset}, handle=${currentShapeHandle ?? null}`); // Save null if undefined
-            const stateSaveResult = await db.prepare("INSERT OR REPLACE INTO sync_state (table_name, last_offset, shape_handle) VALUES (?, ?, ?)")
-                .bind(tableName, finalOffset, currentShapeHandle ?? null) // Bind null if undefined
-                .run();
-            console.log(`[Sync ${tableName}] Final sync state save result:`, JSON.stringify(stateSaveResult, jsonReplacer, 2));
-        } catch (error) {
-            console.error(`[Sync ${tableName}] Error saving final sync state:`, error);
-        }
-    } else {
-        console.log(`[Sync ${tableName}] No final offset received from stream, cannot update sync_state.`);
-    }
-  } catch (error) {
-    // Catch errors from stream setup or promise handling
-    console.error(`[Sync ${tableName}] Critical error during sync stream setup or processing:`, error);
-    // Do not re-throw, allow finally to release lock
-  } finally {
-    // Always release the lock
-    console.log(`[Sync ${tableName}] Releasing lock.`);
-    try {
-      await releaseLock(db, tableName);
-      console.log(`[Sync ${tableName}] Lock released.`);
-    } catch (error) {
-      console.error(`[Sync ${tableName}] Error releasing lock:`, error);
-    }
-    console.log(`[Sync ${tableName}] Sync process finished (including finally block) in ${Date.now() - start}ms.`);
-  }
-}
-
-async function acquireLock(db: D1Database, tableName: string): Promise<boolean> {
-  const now = Math.floor(Date.now() / 1000); // Unix timestamp
-  const lockId = crypto.randomUUID(); // Unique ID for this attempt
-  console.log(`[Lock ${tableName}] Attempting acquire with lockId: ${lockId}, time: ${now}`);
-  try {
-    // Try to insert a lock record
-    await db.prepare(`
-      INSERT INTO sync_lock (table_name, locked_at, lock_id)
-      VALUES (?, ?, ?)
-    `).bind(tableName, now, lockId).run();
-    console.log(`[Lock ${tableName}] Lock acquired successfully with lockId: ${lockId}`);
-    return true;
-  } catch (error: any) {
-    // Check if it's a UNIQUE constraint failure (expected if lock exists)
-    if (error.message?.includes('UNIQUE constraint failed')) {
-       console.log(`[Lock ${tableName}] Lock already exists. Checking if stale.`);
-       // If insert fails due to unique constraint, check if lock is stale (older than 5 minutes)
-       const lock = await db.prepare(`
-         SELECT locked_at, lock_id FROM sync_lock WHERE table_name = ?
-       `).bind(tableName).first() as { locked_at: number, lock_id: string } | undefined;
-       
-       if (lock) {
-         const fiveMinutesAgo = now - (5 * 60);
-         console.log(`[Lock ${tableName}] Found existing lock: ID=${lock.lock_id}, LockedAt=${lock.locked_at}, FiveMinAgo=${fiveMinutesAgo}`);
-         
-         if (lock.locked_at < fiveMinutesAgo) {
-           console.log(`[Lock ${tableName}] Existing lock is stale (older than 5 minutes). Attempting to steal lock.`);
-           // Lock is stale, try to update it (atomic compare-and-swap)
-           try {
-             const updateResult = await db.prepare(`
-               UPDATE sync_lock 
-               SET locked_at = ?, lock_id = ? 
-               WHERE table_name = ? AND lock_id = ? 
-             `).bind(now, lockId, tableName, lock.lock_id).run(); // Use previous lock_id to ensure atomicity
-
-             if (updateResult.meta.changes > 0) {
-                console.log(`[Lock ${tableName}] Stale lock updated successfully with new lockId: ${lockId}`);
-                return true; // Successfully stole the lock
-             } else {
-                console.log(`[Lock ${tableName}] Failed to update stale lock (likely updated by another process between check and update).`);
-                return false; // Another process updated it first
-             }
-
-           } catch (updateError) {
-             console.error(`[Lock ${tableName}] Error updating stale lock:`, updateError);
-             return false; // Error during update
-           }
-         } else {
-            console.log(`[Lock ${tableName}] Existing lock is not stale. Cannot acquire.`);
-            return false; // Lock exists and is not stale
-         }
-       } else {
-          console.warn(`[Lock ${tableName}] Insert failed but could not find existing lock record. Race condition?`);
-          return false; // Should not happen, but handle defensively
-       }
-    } else {
-       // Log unexpected errors during insert
-       console.error(`[Lock ${tableName}] Unexpected error acquiring lock:`, error);
-       return false;
-    }
-  }
-}
-
-async function releaseLock(db: D1Database, tableName: string): Promise<void> {
-  console.log(`[Lock ${tableName}] Attempting to release lock.`);
-  try {
-    // We don't strictly need lock_id for release, but deleting ensures it's gone
-    const result = await db.prepare(`DELETE FROM sync_lock WHERE table_name = ?`).bind(tableName).run();
-    if (result.meta.changes > 0) {
-        console.log(`[Lock ${tableName}] Lock released successfully.`);
-    } else {
-        console.warn(`[Lock ${tableName}] Attempted to release lock, but no lock found for table.`);
-    }
-  } catch (error) {
-     console.error(`[Lock ${tableName}] Error releasing lock:`, error);
-     // Consider if this error should be propagated
-  }
-}
-
-async function getLastSyncState(db: D1Database, tableName: string): Promise<SyncState> {
-  console.log(`[Sync State ${tableName}] Fetching last sync state (offset and handle).`);
-  try {
-    const result = await db.prepare("SELECT last_offset, shape_handle FROM sync_state WHERE table_name = ?")
-                         .bind(tableName)
-                         .first<{ last_offset: Offset | undefined, shape_handle: string | null }>();
-                         
-    const offset = result?.last_offset;
-    const shapeHandle = result?.shape_handle ?? undefined; // Convert null to undefined
-    
-    console.log(`[Sync State ${tableName}] Found state: offset=${offset}, handle=${shapeHandle}`);
-    return { offset, shapeHandle };
-    
-  } catch (error) {
-     console.error(`[Sync State ${tableName}] Error fetching last sync state:`, error);
-     // Return default state if fetch fails
-     return { offset: undefined, shapeHandle: undefined };
   }
 }
 
@@ -579,7 +299,7 @@ async function handleNuke(request: Request, env: Env) {
 
   try {
     console.log(`[Nuke] Initializing database for nuke operation...`);
-    // Initialize database to ensure the sync tables exist (needed for table-specific nuke locks)
+    // Initialize database ensures data tables exist
     await checkAndCreateTables(env.DB);
     console.log(`[Nuke] Database initialized.`);
     
@@ -591,13 +311,8 @@ async function handleNuke(request: Request, env: Env) {
         return new Response(`Invalid table: ${tableName}`, { status: 400 });
       }
       
-      console.log(`[Nuke Table ${tableName}] Attempting lock acquisition.`);
-      const hasLock = await acquireLock(env.DB, tableName);
-      if (!hasLock) {
-        console.log(`[Nuke Table ${tableName}] Could not acquire lock.`);
-        return new Response(`Cannot acquire lock for table ${tableName}`, { status: 409 });
-      }
-       console.log(`[Nuke Table ${tableName}] Lock acquired.`);
+      // Locking removed, proceed directly
+      console.log(`[Nuke Table ${tableName}] Proceeding without lock.`);
     }
 
     // Now proceed with nuking
@@ -613,30 +328,19 @@ async function handleNuke(request: Request, env: Env) {
         console.log(`[Nuke Table ${tableName}] Starting table nuke.`);
         await nukeTable(env.DB, tableName!);
         console.log(`[Nuke Table ${tableName}] Table nuke complete.`);
-        // Release the lock for this table
-        console.log(`[Nuke Table ${tableName}] Releasing lock.`);
-        await releaseLock(env.DB, tableName!);
-        console.log(`[Nuke Table ${tableName}] Lock released.`);
+        // No lock to release
         return new Response(`Table ${tableName} nuked`, { status: 200 });
       
       default:
         // This case should ideally not be reached if using TypeScript types properly
         console.error(`[Nuke] Invalid nuke type received: ${body.type}`);
         // Release lock if it was acquired for an invalid type somehow
-        if (tableName) await releaseLock(env.DB, tableName);
+        // if (tableName) await releaseLock(env.DB, tableName); // Removed lock call
         return new Response(`Invalid nuke type: ${body.type}`, { status: 400 });
     }
   } catch (error) {
     console.error("[Nuke] Error during nuke operation:", error);
-    // Attempt to release lock if held during an error in the main try block
-    if (body.type === 'table' && body.table) {
-        try {
-            console.log(`[Nuke Table ${body.table}] Attempting lock release after error.`);
-            await releaseLock(env.DB, body.table);
-        } catch (releaseError) {
-            console.error(`[Nuke Table ${body.table}] Error releasing lock after nuke error:`, releaseError);
-        }
-    }
+    // No lock release needed here either
     return new Response(error instanceof Error ? error.message : "Internal server error during nuke", { status: 500 });
   }
 }
@@ -645,25 +349,19 @@ async function nukeDatabase(db: D1Database) {
   console.log(`[Nuke DB] Nuking database`);
   const start = Date.now();
   
-  // First clear the sync tables
-  console.log(`[Nuke DB] Deleting from sync_state`);
-  await db.prepare("DELETE FROM sync_state").run();
-  console.log(`[Nuke DB] Deleting from sync_lock`);
-  await db.prepare("DELETE FROM sync_lock").run();
-  
   // Then nuke all actual data tables
   const tableNames = TABLES.map(t => t.name);
   console.log(`[Nuke DB] Nuking tables: ${tableNames.join(', ')}`);
   for (const tableName of tableNames) {
-    await nukeTable(db, tableName, false); // Don't touch sync_state during individual table nuke here
+    await nukeTable(db, tableName);
   }
   
   console.log(`[Nuke DB] Database nuke completed in ${Date.now() - start}ms`);
 }
 
-async function nukeTable(db: D1Database, tableName: string, updateSyncState = true) {
+async function nukeTable(db: D1Database, tableName: string) {
   const start = Date.now();
-  console.log(`[Nuke Table ${tableName}] Starting nuke process (updateSyncState=${updateSyncState})`);
+  console.log(`[Nuke Table ${tableName}] Starting nuke process`);
   
   // Drop the table
   console.log(`[Nuke Table ${tableName}] Dropping table...`);
@@ -690,40 +388,14 @@ async function nukeTable(db: D1Database, tableName: string, updateSyncState = tr
      throw createError; // Propagate if recreation fails
   }
   
-  // Only update sync_state if this is a single table nuke (not part of a database nuke)
-  if (updateSyncState) {
-    console.log(`[Nuke Table ${tableName}] Deleting sync state for this table.`);
-    await db.prepare("DELETE FROM sync_state WHERE table_name = ?").bind(tableName).run();
-    console.log(`[Nuke Table ${tableName}] Sync state deleted.`);
-  }
-  
   console.log(`[Nuke Table ${tableName}] Nuke process completed in ${Date.now() - start}ms`);
 }
 
-// This function checks and creates a specific table and sync tables
-async function checkAndCreateSpecificTable(db: D1Database, tableName: string) {
-  const start = Date.now();
-  console.log(`[Check Specific ${tableName}] Ensuring sync tables and table ${tableName} exist.`);
-  // Define sync tables explicitly for clarity
-  const tablesToCheck = ['sync_state', 'sync_lock', tableName];
-  
-  try {
-    // Check and create sync_state and sync_lock tables, plus the specific table
-    for (const table of tablesToCheck) {
-      console.log(`[Check Specific ${tableName}] Ensuring ${table} exists...`);
-      await ensureTableExists(db, table);
-       console.log(`[Check Specific ${tableName}] Ensured ${table} exists.`);
-    }
-    console.log(`[Check Specific ${tableName}] Table ${tableName} and sync tables checked/created in ${Date.now() - start}ms`);
-  } catch (error) {
-    console.error(`[Check Specific ${tableName}] Error initializing table ${tableName} or sync tables:`, error);
-    throw error;
-  }
-}
-
-async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionContext) {
+// Handles the /sync endpoint trigger
+async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const handlerStart = Date.now();
-  console.log(`[Sync Request] Received sync request to ${request.url}`);
+  console.log(`[Sync Request] Received trigger to process replication queue.`);
+  
   // Validate request method
   if (request.method !== "POST") {
     console.log(`[Sync Request] Invalid method: ${request.method}`);
@@ -738,52 +410,216 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
   }
   console.log(`[Sync Request] Signature validated.`);
   
-  let body: SyncRequest;
-  try {
-    body = await request.json() as SyncRequest;
-    console.log(`[Sync Request] Parsed request body:`, JSON.stringify(body, jsonReplacer));
-  } catch (e) {
-    console.error(`[Sync Request] Error parsing request body:`, e);
-    return new Response("Invalid request body", { status: 400 });
-  }
+  // No body needed, just trigger the queue processing
 
   try {
-    const { table: tableName } = body;
-    
-    // Validate table
-    const table = TABLES.find(t => t.name === tableName);
-    if (!table) {
-      console.log(`[Sync Request] Invalid table specified: ${tableName}`);
-      return new Response(`Invalid table: ${tableName}`, { status: 400 });
-    }
-    console.log(`[Sync Request] Valid table specified: ${tableName}`);
-    
-    // Removed checkAndCreateSpecificTable - assuming scheduled handler ensures tables exist first.
-    console.log(`[Sync Request] Scheduling background sync (table existence checked by scheduled handler). Time: ${Date.now() - handlerStart}ms`);
-    
-    // Run the sync in the background using waitUntil
-    console.log(`[Sync Request] Calling ctx.waitUntil for ${tableName}. Time: ${Date.now() - handlerStart}ms`);
+    // Ensure tables exist (including sync_pgmq_state) before scheduling background task
+    await checkAndCreateTables(env.DB);
+    console.log(`[Sync Request] Database tables checked/ensured. Scheduling background processing. Time: ${Date.now() - handlerStart}ms`);
+
+    // Run the queue processing in the background using waitUntil
     ctx.waitUntil(
       (async () => {
-        console.log(`[Background Sync ${tableName}] Starting background execution.`);
+        console.log(`[Background Queue Sync] Starting background execution.`);
         try {
-          await syncTable(env.DB, table, env);
-          console.log(`[Background Sync ${tableName}] Background execution finished successfully.`);
+          await processReplicationQueue(env.DB, env);
+          console.log(`[Background Queue Sync] Background execution finished successfully.`);
         } catch (error) {
           // Log error from the background task
-          console.error(`[Background Sync ${tableName}] Error during background execution: ${error}`);
-          // Decide if further action is needed (e.g., retry, notification)
+          console.error(`[Background Queue Sync] Error during background execution: ${error}`);
         }
       })()
     );
     
-    // Return success immediately while the sync continues in the background
-    console.log(`[Sync Request] Responding 202 Accepted for ${tableName}. Time: ${Date.now() - handlerStart}ms`);
-    return new Response(`Sync scheduled for ${tableName}`, { status: 202 });
+    // Return success immediately
+    console.log(`[Sync Request] Responding 202 Accepted. Time: ${Date.now() - handlerStart}ms`);
+    return new Response("Replication queue processing scheduled", { status: 202 });
+
   } catch (error) {
     // Catch errors from validation, table checking, or scheduling
-    console.error("[Sync Request] Error handling sync request:", error);
-    return new Response(error instanceof Error ? error.message : "Internal server error during sync request", { status: 500 });
+    console.error("[Sync Request] Error handling sync request trigger:", error);
+    return new Response(error instanceof Error ? error.message : "Internal server error during sync request trigger", { status: 500 });
+  }
+}
+
+// Renamed from processPgmqMessages - Processes the single replication queue
+async function processReplicationQueue(db: D1Database, env: Env) {
+    const queueKey = 'replicate_data'; // Using queue name for logging consistency
+    const startTime = Date.now();
+    console.log(`[${queueKey}] Starting replication queue processing at ${startTime}.`);
+    
+    // let pgPool: Pool | null = null; // Removed pg Pool
+    // let pgClient: PoolClient | null = null; // Removed pg Client
+    let sql: postgres.Sql | null = null; // postgres instance
+    let processedMsgCount = 0;
+    let lastSuccessfullyProcessedMsgId = -1; // Track the last ID successfully processed *before* batch commit
+    let currentBatch: D1PreparedStatement[] = [];
+    const BATCH_SIZE = 998; // D1 batch size
+    let totalQueriesPrepared = 0;
+    let highestMsgIdRead = -1; // Track the highest message ID read in this run
+    const successfullyProcessedMsgIds: bigint[] = []; // Collect IDs for deletion
+    let batchMsgIds: bigint[] = []; // Track IDs in the current D1 batch
+
+    try {
+        // 2. Create PostgreSQL connection instance
+        if (!env.CUSTOM_SUPABASE_DB_URL) {
+             console.error(`[${queueKey}] CUSTOM_SUPABASE_DB_URL not configured.`);
+             throw new Error("CUSTOM_SUPABASE_DB_URL environment variable not set.");
+        }
+        // Create postgres instance with specific options
+        sql = postgres(env.CUSTOM_SUPABASE_DB_URL, {
+            prepare: false, // Use simple query protocol
+            idle_timeout: 2, // Close idle connections after 2 seconds
+            onnotice: (notice: postgres.Notice) => { console.log(`[${queueKey}] PG Notice:`, notice.message); }, // Added Notice type
+        });
+        console.log(`[${queueKey}] PostgreSQL connection handler created.`);
+
+        // No explicit connect needed, postgres handles it
+
+        // 3. Read messages from the single replication queue
+        const queueName = 'replicate_data'; // Fixed queue name
+        const visibilityTimeout = 60; // Visibility timeout in seconds
+        const readLimit = BATCH_SIZE; // Read up to BATCH_SIZE messages at a time
+
+        console.log(`[${queueKey}] Reading messages from queue: ${queueName}`);
+        
+        // Read a batch of messages using postgres sql tag
+        let messages = [];
+        try {
+            // Use tagged template literal for safe query construction
+            messages = await sql`
+                SELECT msg_id, message 
+                FROM pgmq.read(${queueName}, ${visibilityTimeout}, ${readLimit})
+            `;
+        } catch (readError) {
+             console.error(`[${queueKey}] Error reading from pgmq queue ${queueName}:`, readError);
+             throw readError;
+        }
+
+        if (!messages || messages.length === 0) {
+            console.log(`[${queueKey}] No new messages found in queue ${queueName}.`);
+            return; // Nothing to process
+        }
+
+        console.log(`[${queueKey}] Received ${messages.length} messages from queue ${queueName}.`);
+        highestMsgIdRead = messages[messages.length - 1].msg_id; // Store highest ID read
+
+        // 4. Loop through messages:
+        let currentMsgId = -1;
+        for (const pgmqMsg of messages) {
+            currentMsgId = pgmqMsg.msg_id;
+            const currentMsgIdBigInt = BigInt(currentMsgId); // Convert to BigInt early
+
+            // Check if we've exceeded the total query limit for this run
+            if (totalQueriesPrepared >= MAX_QUERIES_PER_RUN) {
+                 console.log(`[${queueKey}] Reached query limit (${MAX_QUERIES_PER_RUN}). Stopping processing for this run after msg_id ${lastSuccessfullyProcessedMsgId}.`);
+                 currentMsgId = -1; // Signal to break outer loop processing
+                 break; // Stop processing more messages
+            }
+
+            try {
+                // a. Parse message content & get target table
+                const msgContent = pgmqMsg.message;
+                const targetTableName = msgContent?.table;
+                if (!targetTableName) {
+                     console.error(`[${queueKey}] Message missing target table name in msg_id ${currentMsgId}:`, msgContent);
+                     throw new Error(`Message missing target table name, msg_id ${currentMsgId}`);
+                }
+                
+                // Find the schema for the target table
+                const tableSchema = TABLES.find(t => t.name === targetTableName);
+                 if (!tableSchema) {
+                    console.error(`[${queueKey}] Unknown table schema for table '${targetTableName}' in msg_id ${currentMsgId}. Skipping.`);
+                    // Decide how to handle: skip or error out?
+                    // Skipping allows other messages to process, but this message is lost.
+                    // Erroring out stops processing, requires manual fix for the schema.
+                    // For now, log and skip, treating as processed for deletion purposes.
+                     successfullyProcessedMsgIds.push(currentMsgIdBigInt); // Add skipped ID for deletion
+                     processedMsgCount++; // Count as processed even if skipped
+                     continue; // Skip this message
+                }
+
+                // b. Use handleMessage to create D1 statement
+                const sqlOperation = handleMessage(pgmqMsg, tableSchema);
+                
+                if (sqlOperation) {
+                    // c. Add statement to batch
+                    currentBatch.push(db.prepare(sqlOperation.sql).bind(...sqlOperation.params));
+                    batchMsgIds.push(currentMsgIdBigInt); // Add ID to current batch tracker
+                    totalQueriesPrepared++;
+                    
+                    // d. If D1 batch size reached, execute batch
+                    if (currentBatch.length >= BATCH_SIZE) {
+                        console.log(`[${queueKey}] D1 batch size (${BATCH_SIZE}) reached at msg_id ${currentMsgId}. Executing batch...`);
+                        await db.batch(currentBatch);
+                        console.log(`[${queueKey}] D1 batch executed successfully.`);
+                        // Add successfully committed batch IDs to the main list
+                        successfullyProcessedMsgIds.push(...batchMsgIds);
+                        currentBatch = []; // Reset batch
+                        batchMsgIds = []; // Reset batch ID tracker
+                        // NOTE: We don't delete here yet, delete in bulk at the end
+                    }
+                } else {
+                    // Handle cases where handleMessage returns null (e.g., unknown op type)
+                    console.warn(`[${queueKey}] No D1 operation generated for msg_id ${currentMsgId}. It will be skipped but deleted.`);
+                    // Treat as processed for deletion purposes
+                    successfullyProcessedMsgIds.push(currentMsgIdBigInt); // Add skipped ID for deletion
+                }
+            } catch (messageError) {
+                console.error(`[${queueKey}] Error processing msg_id ${currentMsgId}:`, messageError);
+                // Stop processing further messages on error to ensure order
+                currentMsgId = -1; // Signal to break outer loop processing
+                break; 
+            }
+            processedMsgCount++;
+        } // End loop through messages
+
+        // 5. Execute remaining batch
+        if (currentBatch.length > 0) {
+            console.log(`[${queueKey}] Executing final D1 batch of ${currentBatch.length} items...`);
+            await db.batch(currentBatch);
+            console.log(`[${queueKey}] Final D1 batch executed successfully.`);
+            // Add remaining successfully committed batch IDs
+            successfullyProcessedMsgIds.push(...batchMsgIds);
+        }
+        
+        // 6. Delete processed messages in pgmq
+        // Delete all messages that were successfully processed or skipped *in this run*
+        if (successfullyProcessedMsgIds.length > 0) {
+            console.log(`[${queueKey}] Deleting ${successfullyProcessedMsgIds.length} processed/skipped messages from queue ${queueName}...`, successfullyProcessedMsgIds);
+            // Use the pgmq.delete version that accepts a bigint[] array
+            try {
+                // Manually construct the array literal string for the query
+                const idsArrayLiteral = `ARRAY[${successfullyProcessedMsgIds.join(',')}]::bigint[]`;
+                // Use raw SQL with the constructed array literal. Only queueName is parameterized.
+                await sql.unsafe(`SELECT pgmq.delete($1::text, ${idsArrayLiteral})`, [queueName]);
+                 console.log(`[${queueKey}] Successfully deleted processed/skipped messages.`);
+            } catch (deleteError) {
+                 console.error(`[${queueKey}] Error deleting processed/skipped messages from queue ${queueName}:`, deleteError, "IDs:", successfullyProcessedMsgIds);
+                 // Critical error: D1 is updated, but messages not deleted. Might lead to reprocessing.
+                 // Throw error
+                 throw deleteError;
+            }
+            
+        } else {
+            // This case means no messages were processed (e.g., all failed before first commit, or read batch was empty)
+            console.log(`[${queueKey}] No messages were successfully processed or skipped in this run. No deletion needed.`);
+        }
+
+    } catch (error) {
+        console.error(`[${queueKey}] Error processing messages:`, error);
+    } finally {
+        // Release the client back to the pool (handled by postgres.js automatically)
+        // if (pgClient) {
+        //     pgClient.release();
+        //     console.log(`[${queueKey}] PostgreSQL client released.`);
+        // }
+        // End the postgres connection pool gracefully
+        if (sql) {
+            await sql.end({ timeout: 5 }); // Add a timeout for ending
+            console.log(`[${queueKey}] PostgreSQL connection pool ended.`);
+        }
+        console.log(`[${queueKey}] Finished processing ${processedMsgCount} messages (up to highest read ID: ${highestMsgIdRead}) in ${Date.now() - startTime}ms. ${successfullyProcessedMsgIds.length} messages marked for deletion.`);
   }
 }
 
@@ -794,14 +630,15 @@ export default {
     console.log(`[Fetch] Received request: ${request.method} ${path}`);
     
     // Log essential env vars (avoid secrets)
-    console.log(`[Fetch] Env ELECTRIC_URL: ${env.ELECTRIC_URL ? 'Set' : 'Not Set'}`);
-    console.log(`[Fetch] Env ELECTRIC_SOURCE_ID: ${env.ELECTRIC_SOURCE_ID ? 'Set' : 'Not Set'}`);
+    console.log(`[Fetch] Env SUPABASE_URL: ${env.SUPABASE_URL ? 'Set' : 'Not Set'}`);
+    // WORKER_BASE_URL is no longer needed for scheduled handler
     
     try {
         if (path === "/nuke") {
           return await handleNuke(request, env);
         }
         
+        // Added back /sync endpoint to trigger queue processing
         if (path === "/sync") {
           return await handleSyncRequest(request, env, ctx);
         }
@@ -819,81 +656,4 @@ export default {
        return new Response("Internal Server Error", { status: 500 });
     }
   },
-
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const startTime = Date.now();
-    console.log(`[Scheduled ${startTime}] Cron triggered at: ${new Date(event.scheduledTime).toISOString()}`);
-    
-    // Log essential env vars (avoid secrets)
-    console.log(`[Scheduled ${startTime}] Env ELECTRIC_URL: ${env.ELECTRIC_URL ? 'Set' : 'Not Set'}`);
-    console.log(`[Scheduled ${startTime}] Env ELECTRIC_SOURCE_ID: ${env.ELECTRIC_SOURCE_ID ? 'Set' : 'Not Set'}`);
-    console.log(`[Scheduled ${startTime}] Env WEBHOOK_SECRET: ${env.WEBHOOK_SECRET ? 'Set' : 'Not Set'}`);
-
-
-    try {
-      // Initialize database first - ensures sync tables exist before triggering syncs
-      console.log(`[Scheduled ${startTime}] Initializing database tables... Time: ${Date.now() - startTime}ms`);
-      await checkAndCreateTables(env.DB);
-      console.log(`[Scheduled ${startTime}] Database tables initialized. Time: ${Date.now() - startTime}ms`);
-      
-      // Helper function for delay
-      const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-      
-      // Determine the worker URL dynamically - THIS IS CRUCIAL
-      // Assuming the worker is accessible via a default route or custom domain.
-      // Option 1: Hardcode (less flexible, needs update if URL changes)
-      // const workerUrl = new URL("https://your-worker-name.your-account.workers.dev/");
-      // Option 2: Construct from request headers (NOT AVAILABLE IN SCHEDULED)
-      // Option 3: Use an environment variable (Recommended)
-      const workerBaseUrl = env.WORKER_BASE_URL || "https://sync.capgo.app"; // Default, but override with env var
-      if (!workerBaseUrl) {
-          console.error(`[Scheduled ${startTime}] WORKER_BASE_URL environment variable is not set. Cannot trigger sync requests.`);
-          return; // Stop if we don't know where to send requests
-      }
-      console.log(`[Scheduled ${startTime}] Using worker base URL: ${workerBaseUrl}`);
-      
-      console.log(`[Scheduled ${startTime}] Starting staggered sync triggers... Time: ${Date.now() - startTime}ms`);
-      for (const table of TABLES) {
-        const syncUrl = new URL("/sync", workerBaseUrl); // Use WORKER_BASE_URL
-        
-        // Stagger the requests
-        await delay(200); // Wait 200ms before triggering the next one
-        console.log(`[Scheduled ${startTime}] Triggering fetch for ${table.name}... Time: ${Date.now() - startTime}ms`);
-
-        // Using waitUntil: Fire-and-forget the trigger. Response/errors handled in background.
-        ctx.waitUntil((async () => {
-           const triggerStart = Date.now();
-           try {
-              const response = await fetch(syncUrl.toString(), {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-webhook-signature": env.WEBHOOK_SECRET // Use the secret to authenticate the self-request
-                },
-                body: JSON.stringify({
-                   table: table.name
-                })
-              });
-              // Log the response from the /sync endpoint *within* waitUntil
-              const status = response.status;
-              const text = await response.text();
-              console.log(`[Scheduled ${startTime} -> WaitUntil ${table.name}] Trigger Response: Status ${status}, Body: ${text}. Trigger Duration: ${Date.now() - triggerStart}ms`);
-              if (!response.ok) {
-                   console.error(`[Scheduled ${startTime} -> WaitUntil ${table.name}] Trigger failed: Status ${status}, Body: ${text}`);
-               }
-           } catch(error) {
-              // Log fetch errors *within* waitUntil
-              console.error(`[Scheduled ${startTime} -> WaitUntil ${table.name}] Trigger fetch error:`, error);
-           }
-        })());
-      }
-      
-      // Removed Promise.all as we are now awaiting each fetch sequentially with delays
-      console.log(`[Scheduled ${startTime}] All sync triggers sent sequentially. Cron execution finished in ${Date.now() - startTime}ms.`);
-    } catch (error) {
-      // Catch errors from checkAndCreateTables or fetch triggering logic
-      console.error(`[Scheduled ${startTime}] Error during scheduled execution:`, error);
-      // Consider adding monitoring/alerting here
-    }
-  }
 };

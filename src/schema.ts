@@ -222,18 +222,6 @@ export const manifestSchema = `${generateCreateTableSQL('manifest', TABLE_DEFINI
 
 ${generateIndexesSQL('manifest', TABLE_DEFINITIONS.manifest).join('\n')}`;
 
-export const syncStateSchema = `CREATE TABLE IF NOT EXISTS sync_state (
-    table_name TEXT PRIMARY KEY,
-    last_offset TEXT NOT NULL,
-    shape_handle TEXT
-);`;
-
-export const syncLockSchema = `CREATE TABLE IF NOT EXISTS sync_lock (
-    table_name TEXT PRIMARY KEY,
-    locked_at INTEGER NOT NULL,
-    lock_id TEXT NOT NULL
-);`;
-
 // Group all schemas for easy access
 export const TABLE_SCHEMAS = {
   app_versions: appVersionsSchema,
@@ -243,7 +231,5 @@ export const TABLE_SCHEMAS = {
   orgs: orgsSchema,
   stripe_info: stripeInfoSchema,
   manifest: manifestSchema,
-  sync_state: syncStateSchema,
-  sync_lock: syncLockSchema
 } as const;
   
