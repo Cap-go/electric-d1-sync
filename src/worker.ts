@@ -17,8 +17,8 @@ const BATCH_SIZE = 998; // D1 batch size for statements
 
 interface Env {
   DB: D1Database;
+  HYPERDRIVE_DB: Hyperdrive; // Add Hyperdrive binding
   WEBHOOK_SECRET: string;
-  CUSTOM_SUPABASE_DB_URL: string; // Add direct DB URL
 }
 
 interface NukeRequest {
@@ -402,7 +402,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
   // Validate signature
   const signature = request.headers.get("x-webhook-signature");
   if (!signature || signature !== env.WEBHOOK_SECRET) {
-    console.log(`[Sync Request] Unauthorized access attempt.`);
+    console.log(`[Sync Request] Unauthorized access attempt.`, signature);
     return new Response("Unauthorized", { status: 401 });
   }
   console.log(`[Sync Request] Signature validated.`);
@@ -456,18 +456,18 @@ async function processReplicationQueue(db: D1Database, env: Env) {
     let batchMsgIds: bigint[] = []; // Track IDs in the current D1 batch
 
     try {
-        // 2. Create PostgreSQL connection instance
-        if (!env.CUSTOM_SUPABASE_DB_URL) {
-             console.error(`[${queueKey}] CUSTOM_SUPABASE_DB_URL not configured.`);
-             throw new Error("CUSTOM_SUPABASE_DB_URL environment variable not set.");
+        // 2. Create PostgreSQL connection using Hyperdrive
+        if (!env.HYPERDRIVE_DB) {
+             console.error(`[${queueKey}] Hyperdrive binding HYPERDRIVE_DB not configured.`);
+             throw new Error("Hyperdrive binding HYPERDRIVE_DB not configured.");
         }
-        // Create postgres instance with specific options
-        sql = postgres(env.CUSTOM_SUPABASE_DB_URL, {
+        // Create postgres instance using the Hyperdrive connection string
+        sql = postgres(env.HYPERDRIVE_DB.connectionString, {
             prepare: false, // Use simple query protocol
             idle_timeout: 2, // Close idle connections after 2 seconds
             onnotice: (notice: postgres.Notice) => { console.log(`[${queueKey}] PG Notice:`, notice.message); }, // Added Notice type
         });
-        console.log(`[${queueKey}] PostgreSQL connection handler created.`);
+        console.log(`[${queueKey}] PostgreSQL connection handler created via Hyperdrive.`);
 
         // No explicit connect needed, postgres handles it
 

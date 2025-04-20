@@ -10,6 +10,12 @@
   "observability": {
     "enabled": true
   },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE_DB",
+      "id": "0f1d77550db142fbb17cb6b3ee659a06"
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
