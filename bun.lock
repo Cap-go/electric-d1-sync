@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "electric-d1-sync",
+      "name": "supabase-d1-sync",
       "dependencies": {
         "@supabase/supabase-js": "^2.45.0",
         "postgres": "^3.4.5",

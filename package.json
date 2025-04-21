@@ -1,5 +1,5 @@
 {
-  "name": "electric-d1-sync",
+  "name": "supabase-d1-sync",
   "version": "0.0.0",
   "private": true,
   "scripts": {
