@@ -2,12 +2,10 @@
 
 import { 
   TABLE_SCHEMAS_TYPES,
-  UUID_COLUMNS,
   TABLES,
   TABLE_SCHEMAS,
-  TableSchema,
-  SQLiteType,
 } from "./schema.ts";
+import type { TableSchema, SQLiteType } from "./schema.ts";
 // import { createClient, SupabaseClient } from '@supabase/supabase-js'; // Removed Supabase client
 // import { Pool, type PoolClient } from 'pg'; // Removed pg Pool
 import postgres from 'postgres'; // Use default import
@@ -94,6 +92,16 @@ function convertValue(value: any, type: SQLiteType): any {
   }
 }
 
+// Helper function to determine if a value is a valid UUID string
+function isUUIDValue(value: any): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  // Regular expression for standard UUID format
+  const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/i;
+  return uuidRegex.test(value);
+}
+
 // Clean fields that are not in the D1 table
 function cleanFields(record: any, tableName: string): Record<string, any> {
   if (!record)
@@ -116,11 +124,10 @@ function cleanFields(record: any, tableName: string): Record<string, any> {
     const type = schema[key];
     const convertedValue = convertValue(value, type);
     if (convertedValue !== null && convertedValue !== undefined) {
-      // Make UUIDs lowercase
-      if (UUID_COLUMNS.has(key) && typeof convertedValue === 'string') {
-        cleanRecord[key] = convertedValue.toLowerCase();
-      }
-      else {
+      // Make UUIDs lowercase if the value is a valid UUID string
+      if (isUUIDValue(convertedValue)) {
+        cleanRecord[key] = (convertedValue as string).toLowerCase();
+      } else {
         cleanRecord[key] = convertedValue;
       }
     }
@@ -474,7 +481,6 @@ async function processReplicationQueue(db: D1Database, env: Env) {
         // 3. Read messages from the single replication queue
         const queueName = 'replicate_data'; // Fixed queue name
         const visibilityTimeout = 60; // Visibility timeout in seconds
-        const readLimit = BATCH_SIZE; // Read up to BATCH_SIZE messages at a time
 
         console.log(`[${queueKey}] Reading messages from queue: ${queueName}`);
         
@@ -484,7 +490,7 @@ async function processReplicationQueue(db: D1Database, env: Env) {
             // Use tagged template literal for safe query construction
             messages = await sql`
                 SELECT msg_id, message 
-                FROM pgmq.read(${queueName}, ${visibilityTimeout}, ${readLimit})
+                FROM pgmq.read(${queueName}, ${visibilityTimeout}, ${BATCH_SIZE})
             `;
         } catch (readError) {
              console.error(`[${queueKey}] Error reading from pgmq queue ${queueName}:`, readError);

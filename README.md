@@ -39,16 +39,39 @@ A trigger function in your source Postgres database writes change events (INSERT
             FOR EACH ROW EXECUTE FUNCTION trigger_http_queue_post_to_function_d1();
         ```
 
-## Schema Configuration (`src/schema.ts`)
+## Schema Configuration (`schema.json`)
 
-**IMPORTANT:** The file `src/schema.ts` is the **single source of truth** for defining which tables and columns are replicated to D1 and how their types are mapped.
+**IMPORTANT:** The file `schema.json` is the **single source of truth** for defining which tables and columns are replicated to D1, how their types are mapped, and which indexes are created.
 
-*   **`TABLE_DEFINITIONS`:** This constant defines the tables to be replicated, their primary keys, and the columns within each table along with their target SQLite types (`INTEGER`, `TEXT`, `BOOLEAN`, `JSON`).
-*   **Data Types:** Ensure the types specified in `columns` correctly map your Postgres types to SQLite types suitable for D1. The worker uses this schema for data conversion.
-*   **Included Tables/Columns:** Only the tables and columns explicitly listed in `TABLE_DEFINITIONS` will be processed by the worker and replicated to D1.
-*   **Indexes:** The script also generates basic `CREATE INDEX` statements based on common patterns (primary keys, foreign key like names) and specific rules (e.g., for `stripe_info`). You might need to add or adjust indexes for your query patterns on the D1 replica.
-
-**You MUST modify `src/schema.ts` to accurately reflect the tables and columns you wish to replicate from your source Postgres database.** Failure to do so will result in incomplete replication or errors.
+*   **Structure:** The `schema.json` file is a JSON object where:
+    *   Each top-level key represents the name of a table in your **source Postgres database** that you want to replicate.
+    *   The value for each table key is an object with the following properties:
+        *   `primaryKey` (string, required): The name of the column that acts as the primary key for this table.
+        *   `columns` (object, required): An object where keys are the source column names you want to replicate, and values are the target **SQLite data type** (`"INTEGER"`, `"TEXT"`, `"BOOLEAN"`, or `"JSON"`) for the corresponding column in the D1 database. The worker uses this for data conversion and table creation.
+            *   **Important:** Only columns listed here will be created in the D1 table and populated during replication. Columns present in the source Postgres table but **omitted** from this object will be **ignored**.
+        *   `indexes` (array, optional): An array defining additional indexes to create on the D1 table (the primary key is always indexed). Each element in the array can be:
+            *   A string: Represents a single column to index (e.g., `"user_id"`).
+            *   An array of strings: Represents a composite index across multiple columns (e.g., `["status", "is_good_plan"]`).
+*   **Customization:** You **must** modify `schema.json` to accurately reflect the tables, columns, primary keys, desired D1 types, and indexes relevant to your specific replication needs. Only the tables and columns defined here will be processed by the worker and replicated to D1.
+*   **Example (`stripe_info` table):**
+    ```json
+    "stripe_info": {
+      "primaryKey": "id",
+      "columns": {
+        "id": "INTEGER",
+        "customer_id": "TEXT",
+        "status": "TEXT",
+        "trial_at": "TEXT",
+        "is_good_plan": "BOOLEAN",
+        // ... other columns
+      },
+      "indexes": [
+        "customer_id", // Single index
+        "trial_at",    // Single index
+        ["status", "is_good_plan"] // Composite index
+      ]
+    }
+    ```
 
 ## Setup
 
