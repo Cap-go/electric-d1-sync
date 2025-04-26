@@ -224,7 +224,7 @@ function handleMessage(pgmqMsg: any, table: TableSchema) {
   }
 }
 
-async function checkAndCreateTables(db: D1Database) {
+async function checkAndCreateTables(db: D1DatabaseSession) {
   const start = Date.now();
   console.log(`[DB Init] Starting database table check/creation...`);
   try {
@@ -241,7 +241,7 @@ async function checkAndCreateTables(db: D1Database) {
   }
 }
 
-async function ensureTableExists(db: D1Database, table: string) {
+async function ensureTableExists(db: D1DatabaseSession, table: string) {
   console.log(`[Ensure Table] Checking existence of table: ${table}`);
   try {
     // Try to select from the table
@@ -262,7 +262,7 @@ async function ensureTableExists(db: D1Database, table: string) {
       const formattedSchema = schema.replace(/\s+/g, ' ').trim();
       console.log(`[Ensure Table] Creating table ${table} with query: "${formattedSchema}"`);
       try {
-        await db.exec(formattedSchema);
+        await db.prepare(formattedSchema).run();
         console.log(`[Ensure Table] Table ${table} created successfully.`);
       } catch (creationError) {
         console.error(`[Ensure Table] Error executing CREATE TABLE for ${table}:`, creationError);
@@ -304,7 +304,7 @@ async function handleNuke(request: Request, env: Env) {
   try {
     console.log(`[Nuke] Initializing database for nuke operation...`);
     // Initialize database ensures data tables exist
-    await checkAndCreateTables(env.DB);
+    await checkAndCreateTables(env.DB.withSession(`first-primary`));
     console.log(`[Nuke] Database initialized.`);
     
     let tableName: string | undefined = undefined;
@@ -323,14 +323,14 @@ async function handleNuke(request: Request, env: Env) {
     switch (body.type) {
       case 'all':
         console.log(`[Nuke All] Starting database nuke.`);
-        await nukeDatabase(env.DB);
+        await nukeDatabase(env.DB.withSession(`first-primary`));
         console.log(`[Nuke All] Database nuke complete.`);
         return new Response("Database nuked", { status: 200 });
       
       case 'table':
         // tableName is already validated and locked
         console.log(`[Nuke Table ${tableName}] Starting table nuke.`);
-        await nukeTable(env.DB, tableName!);
+        await nukeTable(env.DB.withSession(`first-primary`), tableName!);
         console.log(`[Nuke Table ${tableName}] Table nuke complete.`);
         // No lock to release
         return new Response(`Table ${tableName} nuked`, { status: 200 });
@@ -339,7 +339,7 @@ async function handleNuke(request: Request, env: Env) {
         // This case should ideally not be reached if using TypeScript types properly
         console.error(`[Nuke] Invalid nuke type received: ${body.type}`);
         // Release lock if it was acquired for an invalid type somehow
-        // if (tableName) await releaseLock(env.DB, tableName); // Removed lock call
+        // if (tableName) await releaseLock(env.db.withSession(`first-primary`), tableName); // Removed lock call
         return new Response(`Invalid nuke type: ${body.type}`, { status: 400 });
     }
   } catch (error) {
@@ -349,7 +349,7 @@ async function handleNuke(request: Request, env: Env) {
   }
 }
 
-async function nukeDatabase(db: D1Database) {
+async function nukeDatabase(db: D1DatabaseSession) {
   console.log(`[Nuke DB] Nuking database`);
   const start = Date.now();
   
@@ -363,7 +363,7 @@ async function nukeDatabase(db: D1Database) {
   console.log(`[Nuke DB] Database nuke completed in ${Date.now() - start}ms`);
 }
 
-async function nukeTable(db: D1Database, tableName: string) {
+async function nukeTable(db: D1DatabaseSession, tableName: string) {
   const start = Date.now();
   console.log(`[Nuke Table ${tableName}] Starting nuke process`);
   
@@ -385,7 +385,7 @@ async function nukeTable(db: D1Database, tableName: string) {
   }
   console.log(`[Nuke Table ${tableName}] Recreating table...`);
   try {
-    await db.exec(schema);
+    await db.prepare(schema).run();
     console.log(`[Nuke Table ${tableName}] Table recreated.`);
   } catch (createError) {
      console.error(`[Nuke Table ${tableName}] Error recreating table:`, createError);
@@ -418,7 +418,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
 
   try {
     // Ensure tables exist (including sync_pgmq_state) before scheduling background task
-    await checkAndCreateTables(env.DB);
+    await checkAndCreateTables(env.DB.withSession(`first-primary`));
     console.log(`[Sync Request] Database tables checked/ensured. Scheduling background processing. Time: ${Date.now() - handlerStart}ms`);
 
     // Run the queue processing in the background using waitUntil
@@ -426,7 +426,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
       (async () => {
         console.log(`[Background Queue Sync] Starting background execution.`);
         try {
-          await processReplicationQueue(env.DB, env);
+          await processReplicationQueue(env.DB.withSession(`first-primary`), env);
           console.log(`[Background Queue Sync] Background execution finished successfully.`);
         } catch (error) {
           // Log error from the background task
@@ -447,7 +447,7 @@ async function handleSyncRequest(request: Request, env: Env, ctx: ExecutionConte
 }
 
 // Renamed from processPgmqMessages - Processes the single replication queue
-async function processReplicationQueue(db: D1Database, env: Env) {
+async function processReplicationQueue(db: D1DatabaseSession, env: Env) {
     const queueKey = 'replicate_data'; // Using queue name for logging consistency
     const startTime = Date.now();
     console.log(`[${queueKey}] Starting replication queue processing at ${startTime}.`);

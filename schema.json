@@ -46,7 +46,12 @@
       "name",
       "app_id",
       "created_by",
-      "owner_org"
+      "owner_org",
+      "version",
+      ["public", "app_id"],
+      ["app_id", "name"],
+      ["public", "app_id", "android"],
+      ["public", "app_id", "ios"]
     ]
   },
   "channel_devices": {
