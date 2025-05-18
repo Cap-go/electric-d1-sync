@@ -276,6 +276,18 @@ async function ensureTableExists(db: D1DatabaseSession, table: string) {
   }
 }
 
+// Constant-time comparison function to prevent timing attacks
+async function constantTimeComparison(a: string, b: string): Promise<boolean> {
+	const encoder = new TextEncoder();
+	
+	// Hash both strings using SHA-1
+	const aHash = await crypto.subtle.digest('SHA-1', encoder.encode(a));
+	const bHash = await crypto.subtle.digest('SHA-1', encoder.encode(b));
+	
+	// Compare the hashes using timingSafeEqual
+	return crypto.subtle.timingSafeEqual(aHash, bHash);
+}
+
 async function handleNuke(request: Request, env: Env) {
   console.log(`[Nuke] Received nuke request to ${request.url}`);
   if (request.method !== "POST") {
@@ -283,9 +295,10 @@ async function handleNuke(request: Request, env: Env) {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const signature = request.headers.get("x-webhook-signature");
+  const signature = request.headers.get("x-webhook-signature") ?? '';
   // Avoid logging the actual signature unless necessary for debugging
-  if (!signature || signature !== env.WEBHOOK_SECRET) {
+  const isValid = await constantTimeComparison(signature, env.WEBHOOK_SECRET);
+  if (!isValid) {
     console.log(`[Nuke] Unauthorized access attempt.`);
     return new Response("Unauthorized", { status: 401 });
   }
