@@ -460,6 +460,7 @@ async function processReplicationQueue(db: D1DatabaseSession, env: Env) {
     let currentBatch: D1PreparedStatement[] = [];
     let highestMsgIdRead = -1; // Track the highest message ID read in this run
     const successfullyProcessedMsgIds: bigint[] = []; // Collect IDs for deletion
+    const highReadCountMsgIds: bigint[] = []; // Collect IDs for archiving due to high read count
     let batchMsgIds: bigint[] = []; // Track IDs in the current D1 batch
 
     try {
@@ -489,7 +490,7 @@ async function processReplicationQueue(db: D1DatabaseSession, env: Env) {
         try {
             // Use tagged template literal for safe query construction
             messages = await sql`
-                SELECT msg_id, message 
+                SELECT msg_id, message, read_ct 
                 FROM pgmq.read(${queueName}, ${visibilityTimeout}, ${BATCH_SIZE})
             `;
         } catch (readError) {
@@ -510,6 +511,12 @@ async function processReplicationQueue(db: D1DatabaseSession, env: Env) {
         for (const pgmqMsg of messages) {
             currentMsgId = pgmqMsg.msg_id;
             const currentMsgIdBigInt = BigInt(currentMsgId); // Convert to BigInt early
+            if (pgmqMsg.read_ct > 5) {
+                console.log(`[${queueKey}] Skipping msg_id ${currentMsgId} due to high read count (${pgmqMsg.read_ct}).`);
+                highReadCountMsgIds.push(currentMsgIdBigInt);
+                processedMsgCount++;
+                continue;
+            }
 
             try {
                 // a. Parse message content & get target table
@@ -597,6 +604,19 @@ async function processReplicationQueue(db: D1DatabaseSession, env: Env) {
         } else {
             // This case means no messages were processed (e.g., all failed before first commit, or read batch was empty)
             console.log(`[${queueKey}] No messages were successfully processed or skipped in this run. No deletion needed.`);
+        }
+
+        // Archive messages with high read count
+        if (highReadCountMsgIds.length > 0) {
+            console.log(`[${queueKey}] Archiving ${highReadCountMsgIds.length} messages with high read count from queue ${queueName}...`, highReadCountMsgIds);
+            try {
+                const idsArrayLiteral = `ARRAY[${highReadCountMsgIds.join(',')}]::bigint[]`;
+                await sql.unsafe(`SELECT pgmq.archive($1::text, ${idsArrayLiteral})`, [queueName]);
+                console.log(`[${queueKey}] Successfully archived messages with high read count.`);
+            } catch (archiveError) {
+                console.error(`[${queueKey}] Error archiving messages with high read count from queue ${queueName}:`, archiveError, "IDs:", highReadCountMsgIds);
+                throw archiveError;
+            }
         }
 
     } catch (error) {
